@@ -18,22 +18,10 @@ CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
 RATE = 44100
+HOST = '0.0.0.0'  # Listen on all interfaces
 CLIPBOARD_PORT = 5000
 AUDIO_PORT = 5001
 MAX_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
-
-def get_local_ip():
-    """Get local IP address"""
-    try:
-        # Create a socket to get local IP
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Doesn't need to be reachable
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-        s.close()
-        return IP
-    except Exception:
-        return '127.0.0.1'
 
 class ProgressBar:
     def __init__(self, total, prefix='', suffix='', decimals=1, length=50, fill='█', print_end="\r"):
@@ -72,11 +60,8 @@ class ClipboardHandler:
         
     def _clear_clipboard(self):
         try:
-            if os.name == 'nt':  # Windows
-                subprocess.run(['cmd', '/c', 'echo off | clip'], check=True)
-            else:  # Linux/Unix
-                subprocess.run(['xsel', '-b', '-c'], check=True)
-                subprocess.run(['xclip', '-selection', 'clipboard', '-i'], input=b'', check=True)
+            subprocess.run(['xsel', '-b', '-c'], check=True)
+            subprocess.run(['xclip', '-selection', 'clipboard', '-i'], input=b'', check=True)
         except Exception as e:
             logging.error(f"Error clearing clipboard: {e}")
 
@@ -93,25 +78,20 @@ class ClipboardHandler:
 
     def _set_file_to_clipboard(self, file_paths):
         try:
-            if os.name == 'nt':  # Windows
-                # PowerShell command to set files to clipboard
-                ps_script = f"Set-Clipboard -Path {','.join([f"'{path}'" for path in file_paths])}"
-                subprocess.run(['powershell', '-Command', ps_script], check=True)
-            else:  # Linux/Unix
-                uri_list = '\n'.join([f"file://{path}" for path in file_paths])
-                
-                subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
-                             input=uri_list.encode('utf-8'), check=True)
-                
-                subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
-                             input=uri_list.encode('utf-8'), check=True)
-                
-                subprocess.run(['xsel', '-b', '-i'], input=uri_list.encode('utf-8'), check=True)
-                
-                gnome_format = f"copy\n{uri_list}"
-                subprocess.run(['xclip', '-selection', 'clipboard', 
-                              '-t', 'x-special/gnome-copied-files', '-i'], 
-                             input=gnome_format.encode('utf-8'), check=True)
+            uri_list = '\n'.join([f"file://{path}" for path in file_paths])
+            
+            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
+                         input=uri_list.encode('utf-8'), check=True)
+            
+            subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
+                         input=uri_list.encode('utf-8'), check=True)
+            
+            subprocess.run(['xsel', '-b', '-i'], input=uri_list.encode('utf-8'), check=True)
+            
+            gnome_format = f"copy\n{uri_list}"
+            subprocess.run(['xclip', '-selection', 'clipboard', 
+                          '-t', 'x-special/gnome-copied-files', '-i'], 
+                         input=gnome_format.encode('utf-8'), check=True)
 
             logging.info(f"Set clipboard with files: {', '.join(file_paths)}")
             
@@ -119,54 +99,26 @@ class ClipboardHandler:
             logging.error(f"Error setting file to clipboard: {e}")
             try:
                 paths_text = '\n'.join(file_paths)
-                if os.name == 'nt':
-                    subprocess.run(['clip'], input=paths_text.encode('utf-8'), check=True)
-                else:
-                    subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
-                                 input=paths_text.encode('utf-8'), check=True)
+                subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
+                             input=paths_text.encode('utf-8'), check=True)
             except Exception as e2:
                 logging.error(f"Final clipboard attempt failed: {e2}")
 
     def get_clipboard_content(self):
         try:
-            if os.name == 'nt':  # Windows
-                try:
-                    # Try to get clipboard content using PowerShell
-                    ps_script = """
-                    Add-Type -AssemblyName System.Windows.Forms
-                    $clipboard = [System.Windows.Forms.Clipboard]::GetDataObject()
-                    if ($clipboard.GetDataPresent([System.Windows.Forms.DataFormats]::FileDrop)) {
-                        $files = $clipboard.GetData([System.Windows.Forms.DataFormats]::FileDrop)
-                        $files -join "`n"
-                    } else {
-                        [System.Windows.Forms.Clipboard]::GetText()
-                    }
-                    """
-                    result = subprocess.run(['powershell', '-Command', ps_script], 
-                                         capture_output=True, text=True, encoding='utf-8')
-                    if result.stdout.strip():
-                        # Check if it's file paths
-                        lines = result.stdout.strip().split('\n')
-                        if all(os.path.exists(line.strip()) for line in lines):
-                            return self._process_files('\n'.join([f"file://{line.strip()}" for line in lines]))
-                        return {'type': 'text', 'data': result.stdout.strip()}
-                except Exception as e:
-                    logging.error(f"PowerShell clipboard error: {e}")
-                    return None
-            else:  # Linux/Unix
-                text_data = subprocess.run(['xsel', '-b', '-o'], 
-                                         capture_output=True, text=True, encoding='utf-8').stdout.strip()
-                if text_data:
-                    return {'type': 'text', 'data': text_data}
+            text_data = subprocess.run(['xsel', '-b', '-o'], 
+                                     capture_output=True, text=True, encoding='utf-8').stdout.strip()
+            if text_data:
+                return {'type': 'text', 'data': text_data}
+            
+            try:
+                file_data = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
+                                         capture_output=True, text=True, encoding='utf-8').stdout
+                if file_data:
+                    return self._process_files(file_data)
+            except:
+                pass
                 
-                try:
-                    file_data = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
-                                             capture_output=True, text=True, encoding='utf-8').stdout
-                    if file_data:
-                        return self._process_files(file_data)
-                except:
-                    pass
-                    
         except Exception as e:
             logging.error(f"Clipboard error: {e}")
         return None
@@ -178,10 +130,12 @@ class ClipboardHandler:
                 path = uri[7:].strip()
                 if os.path.exists(path):
                     try:
+                        with open(path, 'rb') as f:
+                            file_data = base64.b64encode(f.read()).decode('utf-8')
                         file_info = {
                             'name': os.path.basename(path),
                             'size': os.path.getsize(path),
-                            'path': path
+                            'data': file_data
                         }
                         processed_files.append(file_info)
                     except Exception as e:
@@ -196,16 +150,7 @@ class ClipboardHandler:
             self._clear_clipboard()
             
             if content['type'] == 'text':
-                if os.name == 'nt':  # Windows
-                    subprocess.run(['clip'], input=content['data'].encode('utf-8'), check=True)
-                else:  # Linux/Unix
-                    try:
-                        subprocess.run(['xsel', '-b', '-i'], 
-                                     input=content['data'].encode('utf-8'), check=True)
-                    except:
-                        subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
-                                     input=content['data'].encode('utf-8'), check=True)
-                
+                subprocess.run(['xsel', '-b', '-i'], input=content['data'].encode('utf-8'), check=True)
                 logging.info("Text content set to clipboard")
                 
             elif content['type'] == 'files':
@@ -226,12 +171,102 @@ class ClipboardHandler:
             logging.error(f"Error setting clipboard: {e}")
             self._clear_clipboard()
 
+class AudioServer:
+    def __init__(self):
+        self.p = pyaudio.PyAudio()
+        self.streams = {}
+        self.clients = set()
+        self.running = False
+        self.audio_lock = threading.Lock()
+        
+    def setup_stream(self, client_id):
+        with self.audio_lock:
+            if client_id not in self.streams:
+                self.streams[client_id] = {
+                    'input': self.p.open(
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RATE,
+                        input=True,
+                        frames_per_buffer=CHUNK
+                    ),
+                    'output': self.p.open(
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RATE,
+                        output=True,
+                        frames_per_buffer=CHUNK
+                    )
+                }
+
+    def cleanup_stream(self, client_id):
+        with self.audio_lock:
+            if client_id in self.streams:
+                for stream in self.streams[client_id].values():
+                    if stream:
+                        stream.stop_stream()
+                        stream.close()
+                del self.streams[client_id]
+
+    def cleanup_all(self):
+        with self.audio_lock:
+            for client_id in list(self.streams.keys()):
+                self.cleanup_stream(client_id)
+            self.p.terminate()
+
+    def handle_client(self, client_socket, client_address):
+        client_id = f"{client_address[0]}:{client_address[1]}"
+        self.clients.add(client_socket)
+        self.setup_stream(client_id)
+        
+        def receive_audio():
+            while self.running and client_socket in self.clients:
+                try:
+                    data = client_socket.recv(CHUNK * 4)
+                    if not data:
+                        break
+                    
+                    # Broadcast to other clients
+                    for other_client in self.clients:
+                        if other_client != client_socket:
+                            try:
+                                other_client.send(data)
+                            except:
+                                pass
+                                
+                    # Play locally
+                    if client_id in self.streams:
+                        self.streams[client_id]['output'].write(data)
+                except:
+                    break
+
+        def send_audio():
+            while self.running and client_socket in self.clients:
+                try:
+                    if client_id in self.streams:
+                        data = self.streams[client_id]['input'].read(CHUNK, exception_on_overflow=False)
+                        client_socket.send(data)
+                except:
+                    break
+
+        receive_thread = threading.Thread(target=receive_audio)
+        send_thread = threading.Thread(target=send_audio)
+        
+        receive_thread.start()
+        send_thread.start()
+        
+        receive_thread.join()
+        send_thread.join()
+        
+        self.clients.remove(client_socket)
+        self.cleanup_stream(client_id)
+        client_socket.close()
+
 class UnifiedServer:
     def __init__(self):
         self.running = False
         self.clipboard_handler = ClipboardHandler()
-        self.p = pyaudio.PyAudio()
-        self.audio_streams = {'input': None, 'output': None}
+        self.audio_server = AudioServer()
         self.clients = set()
         logging.basicConfig(
             level=logging.INFO,
@@ -239,29 +274,42 @@ class UnifiedServer:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
 
-    def setup_audio(self):
-        self.audio_streams['input'] = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK
-        )
-        
-        self.audio_streams['output'] = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            output=True,
-            frames_per_buffer=CHUNK
-        )
+    def get_local_ip(self):
+        """Get all local IP addresses"""
+        ips = []
+        try:
+            # Get all network interfaces
+            interfaces = socket.getaddrinfo(
+                host=socket.gethostname(),
+                port=None,
+                family=socket.AF_INET
+            )
+            # Extract unique IPs
+            ips = sorted(list(set(ip[4][0] for ip in interfaces if not ip[4][0].startswith('127.'))))
+        except Exception as e:
+            logging.error(f"Error getting local IPs: {e}")
+            ips = ['127.0.0.1']
+        return ips
 
-    def handle_client(self, client_socket, address):
-        logging.info(f"New connection from {address}")
+    def handle_clipboard_client(self, client_socket, address):
+        logging.info(f"New clipboard connection from {address}")
         self.clients.add(client_socket)
         
         try:
             while self.running:
+                # Check local clipboard for changes
+                current = self.clipboard_handler.get_clipboard_content()
+                if current and current != self.clipboard_handler.last_content:
+                    data = json.dumps(current)
+                    # Broadcast to all clients
+                    for client in self.clients:
+                        try:
+                            client.send(f"{len(data)}:".encode() + data.encode())
+                        except:
+                            pass
+                    self.clipboard_handler.last_content = current
+                
+                # Check for incoming data
                 try:
                     client_socket.settimeout(0.1)
                     header = ""
@@ -272,88 +320,104 @@ class UnifiedServer:
                         header += char
                     
                     size = int(header.strip(":"))
-                    data = client_socket.recv(size).decode('utf-8')
+                    data = client_socket.recv(size).decode()
                     content = json.loads(data)
                     
-                    if content['type'] == 'file_transfer':
-                        self._receive_file(client_socket, content)
-                    else:
+                    if content.get('type'):
                         self.clipboard_handler.set_clipboard_content(content)
                         self.clipboard_handler.last_content = content
                         
                         # Broadcast to other clients
-                        self._broadcast(client_socket, data)
-                        
+                        for other_client in self.clients:
+                            if other_client != client_socket:
+                                try:
+                                    other_client.send(f"{len(data)}:".encode() + data.encode())
+                                except:
+                                    pass
+                            
                 except socket.timeout:
-                    # Check local clipboard for changes
-                    current = self.clipboard_handler.get_clipboard_content()
-                    if current and current != self.clipboard_handler.last_content:
-                        if current['type'] == 'files':
-                            for file_info in current['files']:
-                                self.handle_file_transfer(client_socket, file_info)
-                        else:
-                            data = json.dumps(current)
-                            client_socket.send(f"{len(data)}:".encode() + data.encode('utf-8'))
-                        self.clipboard_handler.last_content = current
+                    pass
                     
-                    time.sleep(0.1)
-                    
+                time.sleep(0.1)
+                
         except Exception as e:
-            logging.error(f"Client error: {e}")
+            logging.error(f"Clipboard client error: {e}")
         finally:
             self.clients.remove(client_socket)
             client_socket.close()
 
-    def _broadcast(self, sender, data):
-        """Broadcast data to all clients except sender"""
-        for client in self.clients:
-            if client != sender:
-                try:
-                    client.send(f"{len(data)}:".encode() + data.encode('utf-8'))
-                except Exception as e:
-                    logging.error(f"Broadcast error: {e}")
-
-    def start(self):
+def start(self):
         self.running = True
-        self.setup_audio()
-        
-        # Get local IP
-        local_ip = get_local_ip()
+        self.audio_server.running = True
         
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clipboard_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        clipboard_server.bind((local_ip, CLIPBOARD_PORT))
+        clipboard_server.bind((HOST, CLIPBOARD_PORT))
         clipboard_server.listen(5)
         
-        logging.info(f"Server started on {local_ip}")
-        logging.info(f"Clipboard service listening on port {CLIPBOARD_PORT}")
+        # Start audio server
+        audio_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        audio_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        audio_server.bind((HOST, AUDIO_PORT))
+        audio_server.listen(5)
+        
+        local_ips = self.get_local_ip()
+        logging.info("Server started on:")
+        for ip in local_ips:
+            logging.info(f"  {ip} - Clipboard port: {CLIPBOARD_PORT}, Audio port: {AUDIO_PORT}")
+        
+        def handle_clipboard_connections():
+            while self.running:
+                try:
+                    client_socket, address = clipboard_server.accept()
+                    thread = threading.Thread(target=self.handle_clipboard_client, 
+                                           args=(client_socket, address))
+                    thread.start()
+                except Exception as e:
+                    if self.running:
+                        logging.error(f"Clipboard server error: {e}")
+
+        def handle_audio_connections():
+            while self.running:
+                try:
+                    client_socket, address = audio_server.accept()
+                    thread = threading.Thread(target=self.audio_server.handle_client,
+                                           args=(client_socket, address))
+                    thread.start()
+                except Exception as e:
+                    if self.running:
+                        logging.error(f"Audio server error: {e}")
+
+        clipboard_thread = threading.Thread(target=handle_clipboard_connections)
+        audio_thread = threading.Thread(target=handle_audio_connections)
+        
+        clipboard_thread.start()
+        audio_thread.start()
         
         try:
             while self.running:
-                try:
-                    clipboard_server.settimeout(1)
-                    client_socket, address = clipboard_server.accept()
-                    client_thread = threading.Thread(target=self.handle_client, 
-                                                  args=(client_socket, address))
-                    client_thread.start()
-                except socket.timeout:
-                    continue
-                    
+                time.sleep(0.1)
         except KeyboardInterrupt:
+            logging.info("Shutting down server...")
             self.running = False
+            self.audio_server.running = False
             
-        finally:
-            # Cleanup
-            clipboard_server.close()
-            for client in self.clients:
+        # Cleanup
+        for client in self.clients:
+            try:
                 client.close()
-            
-            for stream in self.audio_streams.values():
-                if stream:
-                    stream.stop_stream()
-                    stream.close()
-            self.p.terminate()
+            except:
+                pass
+                
+        clipboard_server.close()
+        audio_server.close()
+        self.audio_server.cleanup_all()
+        
+        clipboard_thread.join()
+        audio_thread.join()
+        
+        logging.info("Server shutdown complete")
 
 if __name__ == "__main__":
     server = UnifiedServer()
