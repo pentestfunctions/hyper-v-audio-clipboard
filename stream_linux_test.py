@@ -144,8 +144,117 @@ class ClipboardHandler:
             self._clear_clipboard()
 
 class AudioServer:
-    # [Keep your existing AudioServer class implementation]
-    pass
+    def __init__(self):
+        self.p = pyaudio.PyAudio()
+        self.streams = {}
+        self.clients = set()
+        self.running = False
+        self.audio_lock = threading.Lock()
+        
+    def setup_stream(self, client_id):
+        with self.audio_lock:
+            if client_id not in self.streams:
+                self.streams[client_id] = {
+                    'input': self.p.open(
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RATE,
+                        input=True,
+                        frames_per_buffer=CHUNK
+                    ),
+                    'output': self.p.open(
+                        format=FORMAT,
+                        channels=CHANNELS,
+                        rate=RATE,
+                        output=True,
+                        frames_per_buffer=CHUNK
+                    )
+                }
+                logging.info(f"Audio streams setup for client {client_id}")
+
+    def cleanup_stream(self, client_id):
+        with self.audio_lock:
+            if client_id in self.streams:
+                for stream in self.streams[client_id].values():
+                    if stream:
+                        try:
+                            stream.stop_stream()
+                            stream.close()
+                        except Exception as e:
+                            logging.error(f"Error cleaning up stream: {e}")
+                del self.streams[client_id]
+                logging.info(f"Cleaned up streams for client {client_id}")
+
+    def cleanup_all(self):
+        with self.audio_lock:
+            for client_id in list(self.streams.keys()):
+                self.cleanup_stream(client_id)
+            try:
+                self.p.terminate()
+            except Exception as e:
+                logging.error(f"Error terminating PyAudio: {e}")
+        logging.info("All audio resources cleaned up")
+
+    def handle_client(self, client_socket, client_address):
+        client_id = f"{client_address[0]}:{client_address[1]}"
+        self.clients.add(client_socket)
+        self.running = True
+        logging.info(f"New audio client connected: {client_id}")
+        
+        try:
+            self.setup_stream(client_id)
+            
+            def receive_audio():
+                while self.running and client_socket in self.clients:
+                    try:
+                        data = client_socket.recv(CHUNK * 4)
+                        if not data:
+                            break
+                        
+                        # Broadcast to other clients
+                        for other_client in self.clients:
+                            if other_client != client_socket:
+                                try:
+                                    other_client.send(data)
+                                except Exception as e:
+                                    logging.error(f"Error sending audio to client: {e}")
+                                    
+                        # Play locally if stream exists
+                        if client_id in self.streams:
+                            try:
+                                self.streams[client_id]['output'].write(data)
+                            except Exception as e:
+                                logging.error(f"Error playing audio: {e}")
+                    except Exception as e:
+                        logging.error(f"Error receiving audio: {e}")
+                        break
+
+            def send_audio():
+                while self.running and client_socket in self.clients:
+                    try:
+                        if client_id in self.streams:
+                            data = self.streams[client_id]['input'].read(CHUNK, exception_on_overflow=False)
+                            client_socket.send(data)
+                    except Exception as e:
+                        logging.error(f"Error sending audio: {e}")
+                        break
+
+            receive_thread = threading.Thread(target=receive_audio)
+            send_thread = threading.Thread(target=send_audio)
+            
+            receive_thread.start()
+            send_thread.start()
+            
+            receive_thread.join()
+            send_thread.join()
+            
+        except Exception as e:
+            logging.error(f"Audio client error: {e}")
+        finally:
+            self.clients.remove(client_socket)
+            self.cleanup_stream(client_id)
+            client_socket.close()
+            logging.info(f"Audio client disconnected: {client_id}")
 
 class UnifiedServer:
     def __init__(self):
