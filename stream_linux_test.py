@@ -158,6 +158,21 @@ class UnifiedServer:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
 
+    def get_local_ip(self):
+        """Get all local IP addresses"""
+        ips = []
+        try:
+            interfaces = socket.getaddrinfo(
+                host=socket.gethostname(),
+                port=None,
+                family=socket.AF_INET
+            )
+            ips = sorted(list(set(ip[4][0] for ip in interfaces if not ip[4][0].startswith('127.'))))
+        except Exception as e:
+            logging.error(f"Error getting local IPs: {e}")
+            ips = ['0.0.0.0']
+        return ips
+
     def handle_clipboard_client(self, client_socket, address):
         logging.info(f"New clipboard connection from {address}")
         self.clipboard_handler.clients.add(client_socket)
@@ -219,23 +234,25 @@ class UnifiedServer:
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clipboard_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        clipboard_server.bind((HOST, CLIPBOARD_PORT))
+        clipboard_server.bind(('0.0.0.0', CLIPBOARD_PORT))  # Bind to all interfaces
         clipboard_server.listen(5)
         
         # Start audio server
         audio_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         audio_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        audio_server.bind((HOST, AUDIO_PORT))
+        audio_server.bind(('0.0.0.0', AUDIO_PORT))  # Bind to all interfaces
         audio_server.listen(5)
         
-        logging.info(f"Server started on {HOST}")
-        logging.info(f"Clipboard port: {CLIPBOARD_PORT}")
-        logging.info(f"Audio port: {AUDIO_PORT}")
+        local_ips = self.get_local_ip()
+        logging.info("Server started on:")
+        for ip in local_ips:
+            logging.info(f"  {ip} - Clipboard port: {CLIPBOARD_PORT}, Audio port: {AUDIO_PORT}")
         
         def handle_clipboard_connections():
             while self.running:
                 try:
                     client_socket, address = clipboard_server.accept()
+                    logging.info(f"New clipboard connection from {address}")
                     thread = threading.Thread(target=self.handle_clipboard_client,
                                            args=(client_socket, address))
                     thread.start()
@@ -243,8 +260,23 @@ class UnifiedServer:
                     if self.running:
                         logging.error(f"Clipboard server error: {e}")
 
+        def handle_audio_connections():
+            while self.running:
+                try:
+                    client_socket, address = audio_server.accept()
+                    logging.info(f"New audio connection from {address}")
+                    thread = threading.Thread(target=self.audio_server.handle_client,
+                                           args=(client_socket, address))
+                    thread.start()
+                except Exception as e:
+                    if self.running:
+                        logging.error(f"Audio server error: {e}")
+
         clipboard_thread = threading.Thread(target=handle_clipboard_connections)
+        audio_thread = threading.Thread(target=handle_audio_connections)
+        
         clipboard_thread.start()
+        audio_thread.start()
         
         try:
             while self.running:
@@ -255,7 +287,10 @@ class UnifiedServer:
             
         clipboard_server.close()
         audio_server.close()
+        self.audio_server.cleanup_all()
+        
         clipboard_thread.join()
+        audio_thread.join()
         
         logging.info("Server shutdown complete")
 
