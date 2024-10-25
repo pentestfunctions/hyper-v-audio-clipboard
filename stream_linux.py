@@ -24,6 +24,15 @@ class ClipboardHandler:
     def __init__(self):
         self.last_content = None
         
+    def _clear_clipboard(self):
+        try:
+            # Clear using xsel
+            subprocess.run(['xsel', '-b', '-c'], check=True)
+            # Clear using xclip as backup
+            subprocess.run(['xclip', '-selection', 'clipboard', '-i'], input=b'', check=True)
+        except Exception as e:
+            logging.error(f"Error clearing clipboard: {e}")
+
     def get_clipboard_content(self):
         try:
             # Try text first
@@ -66,22 +75,58 @@ class ClipboardHandler:
 
     def set_clipboard_content(self, content):
         try:
+            # Clear existing clipboard content first
+            self._clear_clipboard()
+            
             if content['type'] == 'text':
-                process = subprocess.Popen(['xsel', '-b'], stdin=subprocess.PIPE)
-                process.communicate(input=content['data'].encode())
+                # Try xsel first
+                try:
+                    process = subprocess.Popen(['xsel', '-b', '-i'], stdin=subprocess.PIPE)
+                    process.communicate(input=content['data'].encode())
+                except:
+                    # Fallback to xclip
+                    process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-i'], stdin=subprocess.PIPE)
+                    process.communicate(input=content['data'].encode())
+                
+                # Verify the clipboard was set
+                try:
+                    result = subprocess.run(['xsel', '-b', '-o'], capture_output=True, text=True).stdout.strip()
+                    if result != content['data']:
+                        raise Exception("Clipboard verification failed")
+                except:
+                    # Try setting again with xclip
+                    process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-i'], stdin=subprocess.PIPE)
+                    process.communicate(input=content['data'].encode())
                 
             elif content['type'] == 'files':
                 save_dir = Path.home() / 'ClipboardSync'
                 save_dir.mkdir(exist_ok=True)
                 
+                file_paths = []
                 for file_info in content['files']:
                     target_path = save_dir / file_info['name']
                     with open(target_path, 'wb') as f:
                         f.write(base64.b64decode(file_info['data']))
+                    file_paths.append(f"file://{target_path}")
+                
+                # Set clipboard to contain the file URIs
+                file_list = '\n'.join(file_paths)
+                try:
+                    # Try xclip for files
+                    process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
+                                            stdin=subprocess.PIPE)
+                    process.communicate(input=file_list.encode())
+                except:
+                    # Fallback to xsel
+                    process = subprocess.Popen(['xsel', '-b', '-i'], stdin=subprocess.PIPE)
+                    process.communicate(input=file_list.encode())
+                
                 logging.info(f"Files saved to: {save_dir}")
                 
         except Exception as e:
             logging.error(f"Error setting clipboard: {e}")
+            # Try to clear clipboard on error
+            self._clear_clipboard()
 
 class UnifiedClient:
     def __init__(self):
