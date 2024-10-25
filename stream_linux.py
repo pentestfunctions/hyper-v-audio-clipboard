@@ -33,6 +33,34 @@ class ClipboardHandler:
         except Exception as e:
             logging.error(f"Error clearing clipboard: {e}")
 
+    def _set_file_to_clipboard(self, file_paths):
+        """
+        Set file URIs to clipboard using both GNOME/GTK and KDE methods
+        """
+        try:
+            # Format paths as URIs
+            uri_list = '\n'.join([f"file://{path}" for path in file_paths])
+            
+            # Set with xclip for GNOME/GTK
+            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
+                         input=uri_list.encode(), check=True)
+            
+            # Also set with regular clipboard for KDE
+            subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
+                         input=uri_list.encode(), check=True)
+            
+            # Backup with xsel
+            subprocess.run(['xsel', '-b', '-i'], input=uri_list.encode(), check=True)
+            
+            # Set x-special/gnome-copied-files format for better GNOME compatibility
+            gnome_format = f"copy\n{uri_list}"
+            subprocess.run(['xclip', '-selection', 'clipboard', 
+                          '-t', 'x-special/gnome-copied-files', '-i'], 
+                         input=gnome_format.encode(), check=True)
+            
+        except Exception as e:
+            logging.error(f"Error setting file to clipboard: {e}")
+
     def get_clipboard_content(self):
         try:
             # Try text first
@@ -88,46 +116,68 @@ class ClipboardHandler:
                     process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-i'], stdin=subprocess.PIPE)
                     process.communicate(input=content['data'].encode())
                 
-                # Verify the clipboard was set
-                try:
-                    result = subprocess.run(['xsel', '-b', '-o'], capture_output=True, text=True).stdout.strip()
-                    if result != content['data']:
-                        raise Exception("Clipboard verification failed")
-                except:
-                    # Try setting again with xclip
-                    process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-i'], stdin=subprocess.PIPE)
-                    process.communicate(input=content['data'].encode())
-                
             elif content['type'] == 'files':
                 save_dir = Path.home() / 'ClipboardSync'
                 save_dir.mkdir(exist_ok=True)
                 
-                file_paths = []
+                saved_paths = []
                 for file_info in content['files']:
                     target_path = save_dir / file_info['name']
                     with open(target_path, 'wb') as f:
                         f.write(base64.b64decode(file_info['data']))
-                    file_paths.append(f"file://{target_path}")
+                    saved_paths.append(str(target_path.absolute()))
                 
-                # Set clipboard to contain the file URIs
-                file_list = '\n'.join(file_paths)
-                try:
-                    # Try xclip for files
-                    process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
-                                            stdin=subprocess.PIPE)
-                    process.communicate(input=file_list.encode())
-                except:
-                    # Fallback to xsel
-                    process = subprocess.Popen(['xsel', '-b', '-i'], stdin=subprocess.PIPE)
-                    process.communicate(input=file_list.encode())
-                
-                logging.info(f"Files saved to: {save_dir}")
+                # Set the saved files to clipboard
+                self._set_file_to_clipboard(saved_paths)
+                logging.info(f"Files saved to: {save_dir} and added to clipboard")
                 
         except Exception as e:
             logging.error(f"Error setting clipboard: {e}")
             # Try to clear clipboard on error
             self._clear_clipboard()
 
+def _receive_file(self, conn, file_info):
+    try:
+        save_dir = Path.home() / 'ClipboardSync'
+        save_dir.mkdir(exist_ok=True)
+        file_path = save_dir / file_info['name']
+        
+        received_size = 0
+        total_size = file_info['size']
+        saved_paths = []
+        
+        with open(file_path, 'wb') as f:
+            while received_size < total_size:
+                header = ""
+                while ":" not in header:
+                    char = conn.recv(1).decode()
+                    if not char:
+                        raise ConnectionError
+                    header += char
+                
+                chunk_size = int(header.strip(":"))
+                chunk = b""
+                while len(chunk) < chunk_size:
+                    part = conn.recv(chunk_size - len(chunk))
+                    if not part:
+                        raise ConnectionError
+                    chunk += part
+                
+                decompressed = zlib.decompress(chunk)
+                f.write(decompressed)
+                
+                received_size += len(decompressed)
+                progress = (received_size / total_size) * 100
+                logging.info(f"Receiving {file_info['name']}: {progress:.1f}%")
+        
+        saved_paths.append(str(file_path.absolute()))
+        logging.info(f"File saved: {file_path}")
+        
+        # Set the received files to clipboard
+        self._set_file_to_clipboard(saved_paths)
+        
+    except Exception as e:
+        logging.error(f"Error receiving file {file_info['name']}: {e}")
 class UnifiedClient:
     def __init__(self):
         self.running = False
