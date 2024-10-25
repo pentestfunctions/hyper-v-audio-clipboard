@@ -23,6 +23,8 @@ MAX_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
 class ClipboardHandler:
     def __init__(self):
         self.last_content = None
+        self.clipboard_dir = Path.home() / 'ClipboardSync'
+        self.clipboard_dir.mkdir(exist_ok=True)
         
     def _clear_clipboard(self):
         try:
@@ -33,73 +35,54 @@ class ClipboardHandler:
         except Exception as e:
             logging.error(f"Error clearing clipboard: {e}")
 
+    def _cleanup_old_files(self):
+        """Clean up all files in the ClipboardSync directory"""
+        try:
+            for file_path in self.clipboard_dir.glob('*'):
+                try:
+                    if file_path.is_file():
+                        file_path.unlink()
+                except Exception as e:
+                    logging.error(f"Error deleting file {file_path}: {e}")
+        except Exception as e:
+            logging.error(f"Error cleaning up directory: {e}")
+
     def _set_file_to_clipboard(self, file_paths):
         """
-        Set file URIs to clipboard using both GNOME/GTK and KDE methods
+        Set file URIs to clipboard using multiple methods for compatibility
         """
         try:
             # Format paths as URIs
             uri_list = '\n'.join([f"file://{path}" for path in file_paths])
             
-            # Set with xclip for GNOME/GTK
+            # Set with xclip for URI list
             subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
                          input=uri_list.encode(), check=True)
             
-            # Also set with regular clipboard for KDE
+            # Set text format as backup
             subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
                          input=uri_list.encode(), check=True)
             
-            # Backup with xsel
+            # Set with xsel as additional backup
             subprocess.run(['xsel', '-b', '-i'], input=uri_list.encode(), check=True)
             
-            # Set x-special/gnome-copied-files format for better GNOME compatibility
+            # Set GNOME format
             gnome_format = f"copy\n{uri_list}"
             subprocess.run(['xclip', '-selection', 'clipboard', 
                           '-t', 'x-special/gnome-copied-files', '-i'], 
                          input=gnome_format.encode(), check=True)
+
+            logging.info(f"Set clipboard with files: {', '.join(file_paths)}")
             
         except Exception as e:
             logging.error(f"Error setting file to clipboard: {e}")
-
-    def get_clipboard_content(self):
-        try:
-            # Try text first
-            text_data = subprocess.run(['xsel', '-b', '-o'], capture_output=True, text=True).stdout.strip()
-            if text_data:
-                return {'type': 'text', 'data': text_data}
-            
-            # Try files (using xclip as backup)
+            # Try basic xclip as last resort
             try:
-                file_data = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
-                                         capture_output=True, text=True).stdout
-                if file_data:
-                    return self._process_files(file_data)
-            except:
-                pass
-                
-        except Exception as e:
-            logging.error(f"Clipboard error: {e}")
-        return None
-
-    def _process_files(self, file_data):
-        processed_files = []
-        for uri in file_data.strip().split('\n'):
-            if uri.startswith('file://'):
-                path = uri[7:].strip()
-                if os.path.exists(path):
-                    try:
-                        file_info = {
-                            'name': os.path.basename(path),
-                            'size': os.path.getsize(path),
-                            'path': path
-                        }
-                        processed_files.append(file_info)
-                    except Exception as e:
-                        logging.error(f"Error processing file {path}: {e}")
-        
-        if processed_files:
-            return {'type': 'files', 'files': processed_files}
-        return None
+                paths_text = '\n'.join(file_paths)
+                subprocess.run(['xclip', '-selection', 'clipboard', '-i'], 
+                             input=paths_text.encode(), check=True)
+            except Exception as e2:
+                logging.error(f"Final clipboard attempt failed: {e2}")
 
     def set_clipboard_content(self, content):
         try:
@@ -117,67 +100,69 @@ class ClipboardHandler:
                     process.communicate(input=content['data'].encode())
                 
             elif content['type'] == 'files':
-                save_dir = Path.home() / 'ClipboardSync'
-                save_dir.mkdir(exist_ok=True)
+                # Clean up old files first
+                self._cleanup_old_files()
                 
                 saved_paths = []
                 for file_info in content['files']:
-                    target_path = save_dir / file_info['name']
+                    target_path = self.clipboard_dir / file_info['name']
                     with open(target_path, 'wb') as f:
                         f.write(base64.b64decode(file_info['data']))
                     saved_paths.append(str(target_path.absolute()))
                 
                 # Set the saved files to clipboard
-                self._set_file_to_clipboard(saved_paths)
-                logging.info(f"Files saved to: {save_dir} and added to clipboard")
+                if saved_paths:
+                    self._set_file_to_clipboard(saved_paths)
+                    logging.info(f"Files saved to: {self.clipboard_dir} and added to clipboard")
                 
         except Exception as e:
             logging.error(f"Error setting clipboard: {e}")
             # Try to clear clipboard on error
             self._clear_clipboard()
 
-def _receive_file(self, conn, file_info):
-    try:
-        save_dir = Path.home() / 'ClipboardSync'
-        save_dir.mkdir(exist_ok=True)
-        file_path = save_dir / file_info['name']
-        
-        received_size = 0
-        total_size = file_info['size']
-        saved_paths = []
-        
-        with open(file_path, 'wb') as f:
-            while received_size < total_size:
-                header = ""
-                while ":" not in header:
-                    char = conn.recv(1).decode()
-                    if not char:
-                        raise ConnectionError
-                    header += char
-                
-                chunk_size = int(header.strip(":"))
-                chunk = b""
-                while len(chunk) < chunk_size:
-                    part = conn.recv(chunk_size - len(chunk))
-                    if not part:
-                        raise ConnectionError
-                    chunk += part
-                
-                decompressed = zlib.decompress(chunk)
-                f.write(decompressed)
-                
-                received_size += len(decompressed)
-                progress = (received_size / total_size) * 100
-                logging.info(f"Receiving {file_info['name']}: {progress:.1f}%")
-        
-        saved_paths.append(str(file_path.absolute()))
-        logging.info(f"File saved: {file_path}")
-        
-        # Set the received files to clipboard
-        self._set_file_to_clipboard(saved_paths)
-        
-    except Exception as e:
-        logging.error(f"Error receiving file {file_info['name']}: {e}")
+    def _receive_file(self, conn, file_info):
+        try:
+            # Clean up old files before receiving new ones
+            self._cleanup_old_files()
+            
+            file_path = self.clipboard_dir / file_info['name']
+            received_size = 0
+            total_size = file_info['size']
+            saved_paths = []
+            
+            with open(file_path, 'wb') as f:
+                while received_size < total_size:
+                    header = ""
+                    while ":" not in header:
+                        char = conn.recv(1).decode()
+                        if not char:
+                            raise ConnectionError
+                        header += char
+                    
+                    chunk_size = int(header.strip(":"))
+                    chunk = b""
+                    while len(chunk) < chunk_size:
+                        part = conn.recv(chunk_size - len(chunk))
+                        if not part:
+                            raise ConnectionError
+                        chunk += part
+                    
+                    decompressed = zlib.decompress(chunk)
+                    f.write(decompressed)
+                    
+                    received_size += len(decompressed)
+                    progress = (received_size / total_size) * 100
+                    logging.info(f"Receiving {file_info['name']}: {progress:.1f}%")
+            
+            saved_paths.append(str(file_path.absolute()))
+            logging.info(f"File saved: {file_path}")
+            
+            # Set the received files to clipboard
+            if saved_paths:
+                self._set_file_to_clipboard(saved_paths)
+            
+        except Exception as e:
+            logging.error(f"Error receiving file {file_info['name']}: {e}")
 class UnifiedClient:
     def __init__(self):
         self.running = False
