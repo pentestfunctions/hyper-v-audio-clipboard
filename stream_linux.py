@@ -118,6 +118,7 @@ class ClipboardHandler:
                 logging.error(f"Final clipboard attempt failed: {e2}")
 
     def get_clipboard_content(self):
+        """Get current clipboard content"""
         try:
             # Try text first
             text_data = subprocess.run(['xsel', '-b', '-o'], capture_output=True, text=True).stdout.strip()
@@ -158,6 +159,7 @@ class ClipboardHandler:
         return None
 
     def set_clipboard_content(self, content):
+        """Set clipboard content"""
         try:
             # Clear existing clipboard content first
             self._clear_clipboard()
@@ -198,7 +200,7 @@ class ClipboardHandler:
 class UnifiedClient:
     def __init__(self):
         self.running = False
-        self.clipboard = ClipboardHandler()
+        self.clipboard_handler = ClipboardHandler()  # Changed from self.clipboard to self.clipboard_handler
         self.p = pyaudio.PyAudio()
         self.audio_streams = {'input': None, 'output': None}
         logging.basicConfig(
@@ -261,9 +263,9 @@ class UnifiedClient:
     def _receive_file(self, conn, file_info):
         try:
             # Clean up old files before receiving new ones
-            self.clipboard._cleanup_old_files()
+            self.clipboard_handler._cleanup_old_files()  # Updated to use clipboard_handler
             
-            file_path = self.clipboard.clipboard_dir / file_info['name']
+            file_path = self.clipboard_handler.clipboard_dir / file_info['name']  # Updated to use clipboard_handler
             received_size = 0
             total_size = file_info['size']
             saved_paths = []
@@ -299,7 +301,7 @@ class UnifiedClient:
             
             # Set the received files to clipboard
             if saved_paths:
-                self.clipboard._set_file_to_clipboard(saved_paths)
+                self.clipboard_handler._set_file_to_clipboard(saved_paths)  # Updated to use clipboard_handler
             
         except Exception as e:
             logging.error(f"Error receiving file {file_info['name']}: {e}")
@@ -314,15 +316,15 @@ class UnifiedClient:
                 
                 while self.running:
                     # Check local clipboard for changes
-                    current = self.clipboard.get_clipboard_content()
-                    if current and current != self.clipboard.last_content:
+                    current = self.clipboard_handler.get_clipboard_content()  # Updated to use clipboard_handler
+                    if current and current != self.clipboard_handler.last_content:  # Updated to use clipboard_handler
                         if current['type'] == 'files':
                             for file_info in current['files']:
                                 self.handle_file_transfer(clipboard_socket, file_info)
                         else:
                             data = json.dumps(current)
                             clipboard_socket.send(f"{len(data)}:".encode() + data.encode())
-                        self.clipboard.last_content = current
+                        self.clipboard_handler.last_content = current  # Updated to use clipboard_handler
                     
                     # Check for incoming data
                     try:
@@ -341,8 +343,8 @@ class UnifiedClient:
                         if content['type'] == 'file_transfer':
                             self._receive_file(clipboard_socket, content)
                         else:
-                            self.clipboard.set_clipboard_content(content)
-                            self.clipboard.last_content = content
+                            self.clipboard_handler.set_clipboard_content(content)  # Updated to use clipboard_handler
+                            self.clipboard_handler.last_content = content  # Updated to use clipboard_handler
                             
                     except socket.timeout:
                         pass
@@ -370,6 +372,15 @@ class UnifiedClient:
                             data = audio_socket.recv(CHUNK * 4)
                             if data and self.audio_streams['output']:
                                 self.audio_streams['output'].write(data)
+                        except:
+                            break
+                            
+                def send_audio():
+                    while self.running:
+                        try:
+                            if self.audio_streams['input']:
+                                data = self.audio_streams['input'].read(CHUNK, exception_on_overflow=False)
+                                audio_socket.send(data)
                         except:
                             break
                             
