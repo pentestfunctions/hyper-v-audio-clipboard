@@ -346,7 +346,7 @@ class UnifiedServer:
             self.clients.remove(client_socket)
             client_socket.close()
 
-def start(self):
+    def start(self):
         self.running = True
         self.audio_server.running = True
         
