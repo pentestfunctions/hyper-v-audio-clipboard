@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import socket
 import subprocess
 import threading
@@ -9,6 +10,8 @@ import pyaudio
 import logging
 from pathlib import Path
 import zlib
+import sys
+from datetime import datetime
 
 # Configuration
 HOST = '192.168.0.207'
@@ -19,6 +22,36 @@ RATE = 44100
 CLIPBOARD_PORT = 5000
 AUDIO_PORT = 5001
 MAX_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
+
+class ProgressBar:
+    def __init__(self, total, prefix='', suffix='', decimals=1, length=50, fill='█', print_end="\r"):
+        self.total = total
+        self.prefix = prefix
+        self.suffix = suffix
+        self.decimals = decimals
+        self.length = length
+        self.fill = fill
+        self.print_end = print_end
+        self.current = 0
+        self.last_update = 0
+        self._update_progress(0)
+
+    def update(self, current):
+        self.current = current
+        current_time = time.time()
+        # Update at most every 0.1 seconds to avoid flooding the console
+        if current_time - self.last_update > 0.1 or current >= self.total:
+            self._update_progress(current)
+            self.last_update = current_time
+
+    def _update_progress(self, current):
+        percent = f"{100 * (current / float(self.total)):.{self.decimals}f}"
+        filled_length = int(self.length * current // self.total)
+        bar = self.fill * filled_length + '-' * (self.length - filled_length)
+        sys.stdout.write(f'\r{self.prefix} |{bar}| {percent}% {self.suffix}')
+        if current >= self.total:
+            sys.stdout.write('\n')
+        sys.stdout.flush()
 
 class ClipboardHandler:
     def __init__(self):
@@ -84,6 +117,46 @@ class ClipboardHandler:
             except Exception as e2:
                 logging.error(f"Final clipboard attempt failed: {e2}")
 
+    def get_clipboard_content(self):
+        try:
+            # Try text first
+            text_data = subprocess.run(['xsel', '-b', '-o'], capture_output=True, text=True).stdout.strip()
+            if text_data:
+                return {'type': 'text', 'data': text_data}
+            
+            # Try files (using xclip as backup)
+            try:
+                file_data = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
+                                         capture_output=True, text=True).stdout
+                if file_data:
+                    return self._process_files(file_data)
+            except:
+                pass
+                
+        except Exception as e:
+            logging.error(f"Clipboard error: {e}")
+        return None
+
+    def _process_files(self, file_data):
+        processed_files = []
+        for uri in file_data.strip().split('\n'):
+            if uri.startswith('file://'):
+                path = uri[7:].strip()
+                if os.path.exists(path):
+                    try:
+                        file_info = {
+                            'name': os.path.basename(path),
+                            'size': os.path.getsize(path),
+                            'path': path
+                        }
+                        processed_files.append(file_info)
+                    except Exception as e:
+                        logging.error(f"Error processing file {path}: {e}")
+        
+        if processed_files:
+            return {'type': 'files', 'files': processed_files}
+        return None
+
     def set_clipboard_content(self, content):
         try:
             # Clear existing clipboard content first
@@ -98,6 +171,8 @@ class ClipboardHandler:
                     # Fallback to xclip
                     process = subprocess.Popen(['xclip', '-selection', 'clipboard', '-i'], stdin=subprocess.PIPE)
                     process.communicate(input=content['data'].encode())
+                
+                logging.info("Text content set to clipboard")
                 
             elif content['type'] == 'files':
                 # Clean up old files first
@@ -120,56 +195,17 @@ class ClipboardHandler:
             # Try to clear clipboard on error
             self._clear_clipboard()
 
-    def _receive_file(self, conn, file_info):
-        try:
-            # Clean up old files before receiving new ones
-            self._cleanup_old_files()
-            
-            file_path = self.clipboard_dir / file_info['name']
-            received_size = 0
-            total_size = file_info['size']
-            saved_paths = []
-            
-            with open(file_path, 'wb') as f:
-                while received_size < total_size:
-                    header = ""
-                    while ":" not in header:
-                        char = conn.recv(1).decode()
-                        if not char:
-                            raise ConnectionError
-                        header += char
-                    
-                    chunk_size = int(header.strip(":"))
-                    chunk = b""
-                    while len(chunk) < chunk_size:
-                        part = conn.recv(chunk_size - len(chunk))
-                        if not part:
-                            raise ConnectionError
-                        chunk += part
-                    
-                    decompressed = zlib.decompress(chunk)
-                    f.write(decompressed)
-                    
-                    received_size += len(decompressed)
-                    progress = (received_size / total_size) * 100
-                    logging.info(f"Receiving {file_info['name']}: {progress:.1f}%")
-            
-            saved_paths.append(str(file_path.absolute()))
-            logging.info(f"File saved: {file_path}")
-            
-            # Set the received files to clipboard
-            if saved_paths:
-                self._set_file_to_clipboard(saved_paths)
-            
-        except Exception as e:
-            logging.error(f"Error receiving file {file_info['name']}: {e}")
 class UnifiedClient:
     def __init__(self):
         self.running = False
         self.clipboard = ClipboardHandler()
         self.p = pyaudio.PyAudio()
         self.audio_streams = {'input': None, 'output': None}
-        logging.basicConfig(level=logging.INFO)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
 
     def setup_audio(self):
         self.audio_streams['input'] = self.p.open(
@@ -202,6 +238,10 @@ class UnifiedClient:
                 })
                 conn.send(f"{len(header)}:".encode() + header.encode())
                 
+                # Create progress bar
+                progress = ProgressBar(total_size, prefix=f'Sending {file_info["name"]}:', 
+                                    suffix='Complete', length=50)
+                
                 while sent_size < total_size:
                     chunk = f.read(MAX_CHUNK_SIZE)
                     if not chunk:
@@ -213,20 +253,24 @@ class UnifiedClient:
                     conn.send(size_header + compressed)
                     
                     sent_size += len(chunk)
-                    progress = (sent_size / total_size) * 100
-                    logging.info(f"Sending {file_info['name']}: {progress:.1f}%")
+                    progress.update(sent_size)
                     
         except Exception as e:
             logging.error(f"Error sending file {file_info['name']}: {e}")
 
     def _receive_file(self, conn, file_info):
         try:
-            save_dir = Path.home() / 'ClipboardSync'
-            save_dir.mkdir(exist_ok=True)
-            file_path = save_dir / file_info['name']
+            # Clean up old files before receiving new ones
+            self.clipboard._cleanup_old_files()
             
+            file_path = self.clipboard.clipboard_dir / file_info['name']
             received_size = 0
             total_size = file_info['size']
+            saved_paths = []
+            
+            # Create progress bar
+            progress = ProgressBar(total_size, prefix=f'Receiving {file_info["name"]}:', 
+                                suffix='Complete', length=50)
             
             with open(file_path, 'wb') as f:
                 while received_size < total_size:
@@ -249,10 +293,13 @@ class UnifiedClient:
                     f.write(decompressed)
                     
                     received_size += len(decompressed)
-                    progress = (received_size / total_size) * 100
-                    logging.info(f"Receiving {file_info['name']}: {progress:.1f}%")
-                    
-            logging.info(f"File saved: {file_path}")
+                    progress.update(received_size)
+            
+            saved_paths.append(str(file_path.absolute()))
+            
+            # Set the received files to clipboard
+            if saved_paths:
+                self.clipboard._set_file_to_clipboard(saved_paths)
             
         except Exception as e:
             logging.error(f"Error receiving file {file_info['name']}: {e}")
