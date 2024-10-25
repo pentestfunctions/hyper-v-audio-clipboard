@@ -154,23 +154,27 @@ class AudioServer:
     def setup_stream(self, client_id):
         with self.audio_lock:
             if client_id not in self.streams:
-                self.streams[client_id] = {
-                    'input': self.p.open(
-                        format=FORMAT,
-                        channels=CHANNELS,
-                        rate=RATE,
-                        input=True,
-                        frames_per_buffer=CHUNK
-                    ),
-                    'output': self.p.open(
-                        format=FORMAT,
-                        channels=CHANNELS,
-                        rate=RATE,
-                        output=True,
-                        frames_per_buffer=CHUNK
-                    )
-                }
-                logging.info(f"Audio streams setup for client {client_id}")
+                try:
+                    self.streams[client_id] = {
+                        'input': self.p.open(
+                            format=FORMAT,
+                            channels=CHANNELS,
+                            rate=RATE,
+                            input=True,
+                            frames_per_buffer=CHUNK
+                        ),
+                        'output': self.p.open(
+                            format=FORMAT,
+                            channels=CHANNELS,
+                            rate=RATE,
+                            output=True,
+                            frames_per_buffer=CHUNK
+                        )
+                    }
+                    logging.info(f"Audio streams setup for client {client_id}")
+                except Exception as e:
+                    logging.error(f"Error setting up audio streams: {e}")
+                    raise
 
     def cleanup_stream(self, client_id):
         with self.audio_lock:
@@ -198,14 +202,14 @@ class AudioServer:
     def handle_client(self, client_socket, client_address):
         client_id = f"{client_address[0]}:{client_address[1]}"
         self.clients.add(client_socket)
-        self.running = True
+        client_running = True
         logging.info(f"New audio client connected: {client_id}")
         
         try:
             self.setup_stream(client_id)
             
             def receive_audio():
-                while self.running and client_socket in self.clients:
+                while self.running and client_running and client_socket in self.clients:
                     try:
                         data = client_socket.recv(CHUNK * 4)
                         if not data:
@@ -230,7 +234,7 @@ class AudioServer:
                         break
 
             def send_audio():
-                while self.running and client_socket in self.clients:
+                while self.running and client_running and client_socket in self.clients:
                     try:
                         if client_id in self.streams:
                             data = self.streams[client_id]['input'].read(CHUNK, exception_on_overflow=False)
@@ -242,18 +246,26 @@ class AudioServer:
             receive_thread = threading.Thread(target=receive_audio)
             send_thread = threading.Thread(target=send_audio)
             
+            receive_thread.daemon = True
+            send_thread.daemon = True
+            
             receive_thread.start()
             send_thread.start()
             
-            receive_thread.join()
-            send_thread.join()
+            # Wait for threads to complete
+            while self.running and client_running and client_socket in self.clients:
+                time.sleep(0.1)
             
         except Exception as e:
             logging.error(f"Audio client error: {e}")
         finally:
+            client_running = False
             self.clients.remove(client_socket)
             self.cleanup_stream(client_id)
-            client_socket.close()
+            try:
+                client_socket.close()
+            except:
+                pass
             logging.info(f"Audio client disconnected: {client_id}")
 
 class UnifiedServer:
@@ -339,17 +351,18 @@ class UnifiedServer:
 
     def start(self):
         self.running = True
+        self.audio_server.running = True  # Set audio server running flag
         
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clipboard_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        clipboard_server.bind(('0.0.0.0', CLIPBOARD_PORT))  # Bind to all interfaces
+        clipboard_server.bind(('0.0.0.0', CLIPBOARD_PORT))
         clipboard_server.listen(5)
         
         # Start audio server
         audio_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         audio_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        audio_server.bind(('0.0.0.0', AUDIO_PORT))  # Bind to all interfaces
+        audio_server.bind(('0.0.0.0', AUDIO_PORT))
         audio_server.listen(5)
         
         local_ips = self.get_local_ip()
@@ -376,6 +389,7 @@ class UnifiedServer:
                     logging.info(f"New audio connection from {address}")
                     thread = threading.Thread(target=self.audio_server.handle_client,
                                            args=(client_socket, address))
+                    thread.daemon = True  # Make audio threads daemon threads
                     thread.start()
                 except Exception as e:
                     if self.running:
