@@ -7,13 +7,57 @@ import logging
 from queue import Queue
 import signal
 import sys
+import subprocess
+import os
 
-# Audio Configuration for PulseAudio
+# Audio Configuration
 CHUNK = 1024
-FORMAT = pyaudio.paInt16  # Back to Int16 for better compatibility
+FORMAT = pyaudio.paInt16
 CHANNELS = 2
-RATE = 44100  # Match detected sample rate
+RATE = 44100
 AUDIO_PORT = 5001
+
+def setup_audio_services():
+    """Initialize and restart audio services"""
+    try:
+        logging.info("Setting up audio services...")
+        
+        # Kill any existing PulseAudio processes
+        subprocess.run(['pulseaudio', '-k'], stderr=subprocess.PIPE)
+        time.sleep(1)
+        
+        # Start PulseAudio if not running
+        subprocess.run(['pulseaudio', '--start'], stderr=subprocess.PIPE)
+        time.sleep(2)
+        
+        # Restart PipeWire services
+        commands = [
+            'systemctl --user restart pipewire',
+            'systemctl --user restart pipewire-pulse',
+            'systemctl --user restart pulseaudio'
+        ]
+        
+        for cmd in commands:
+            try:
+                subprocess.run(cmd.split(), stderr=subprocess.PIPE)
+                time.sleep(1)
+            except Exception as e:
+                logging.warning(f"Command failed: {cmd} - {e}")
+        
+        # Load audio modules if needed
+        subprocess.run(['pactl', 'load-module', 'module-null-sink'], stderr=subprocess.PIPE)
+        
+        # Test audio system
+        try:
+            subprocess.run(['pactl', 'info'], check=True, stdout=subprocess.PIPE)
+            logging.info("Audio services initialized successfully")
+        except subprocess.CalledProcessError:
+            logging.error("Failed to verify audio system")
+            raise
+            
+    except Exception as e:
+        logging.error(f"Error setting up audio services: {e}")
+        raise
 
 class AudioHandler:
     def __init__(self):
@@ -23,13 +67,18 @@ class AudioHandler:
     def setup_streams(self):
         """Setup audio streams using default PulseAudio devices"""
         try:
-            # Use device index 0 (pulse) for both input and output
+            # Make sure audio services are running
+            setup_audio_services()
+            
+            # List available devices for debugging
+            self.list_devices()
+            
             self.streams['input'] = self.p.open(
                 format=FORMAT,
                 channels=CHANNELS,
                 rate=RATE,
                 input=True,
-                input_device_index=0,  # Pulse device
+                input_device_index=0,
                 frames_per_buffer=CHUNK
             )
             logging.info("Input stream setup successfully using PulseAudio")
@@ -39,13 +88,29 @@ class AudioHandler:
                 channels=CHANNELS,
                 rate=RATE,
                 output=True,
-                output_device_index=0,  # Pulse device
+                output_device_index=0,
                 frames_per_buffer=CHUNK
             )
             logging.info("Output stream setup successfully using PulseAudio")
             
         except Exception as e:
             logging.error(f"Error setting up streams: {e}")
+            raise
+
+    def list_devices(self):
+        """List all available audio devices"""
+        info = []
+        for i in range(self.p.get_device_count()):
+            try:
+                device_info = self.p.get_device_info_by_index(i)
+                info.append(f"Device {i}: {device_info['name']}")
+                info.append(f"  Input channels: {device_info['maxInputChannels']}")
+                info.append(f"  Output channels: {device_info['maxOutputChannels']}")
+                info.append(f"  Default SampleRate: {device_info['defaultSampleRate']}")
+                info.append("")
+            except Exception as e:
+                info.append(f"Error getting device {i} info: {e}")
+        logging.info("Available audio devices:\n" + '\n'.join(info))
 
     def cleanup(self):
         for stream in self.streams.values():
@@ -125,12 +190,14 @@ class AudioServer:
 
     def start(self):
         self.running = True
-        self.audio.setup_streams()
-        
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         try:
+            # Initialize audio services and streams
+            self.audio.setup_streams()
+            
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            
             server_socket.bind((self.host, AUDIO_PORT))
             server_socket.listen(5)
             logging.info(f"Audio server listening on {self.host}:{AUDIO_PORT}")
@@ -165,5 +232,10 @@ class AudioServer:
         self.audio.cleanup()
 
 if __name__ == "__main__":
+    # Ensure script is run with sudo if needed
+    if os.geteuid() != 0:
+        logging.warning("This script might need sudo privileges to manage audio services")
+        logging.warning("If you experience issues, try running with sudo")
+    
     server = AudioServer()
     server.start()
