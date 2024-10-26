@@ -111,7 +111,127 @@ class AudioServer:
                 if self.running:
                     logging.error(f"Audio streaming error: {e}")
 
-[Previous ClipboardHandler class code remains exactly the same]
+class ClipboardHandler:
+    def __init__(self):
+        self.last_content = None
+        self.clipboard_dir = Path.home() / 'ClipboardSync'
+        self.clipboard_dir.mkdir(exist_ok=True)
+        self.clients = set()
+        
+    def _clear_clipboard(self):
+        try:
+            subprocess.run(['xsel', '-b', '-c'], check=True)
+            subprocess.run(['xclip', '-selection', 'clipboard', '-i'], input=b'', check=True)
+        except Exception as e:
+            logging.error(f"Error clearing clipboard: {e}")
+
+    def _cleanup_old_files(self):
+        try:
+            for file_path in self.clipboard_dir.glob('*'):
+                try:
+                    if file_path.is_file():
+                        file_path.unlink()
+                except Exception as e:
+                    logging.error(f"Error deleting file {file_path}: {e}")
+        except Exception as e:
+            logging.error(f"Error cleaning up directory: {e}")
+
+    def _set_file_to_clipboard(self, file_paths):
+        try:
+            uri_list = '\n'.join([f"file://{path}" for path in file_paths])
+            
+            # Set with xclip for URI list
+            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
+                         input=uri_list.encode('utf-8'), check=True)
+            
+            # Set with xsel as backup
+            subprocess.run(['xsel', '-b', '-i'], input=uri_list.encode('utf-8'), check=True)
+            
+            # Set GNOME format
+            gnome_format = f"copy\n{uri_list}"
+            subprocess.run(['xclip', '-selection', 'clipboard', 
+                          '-t', 'x-special/gnome-copied-files', '-i'], 
+                         input=gnome_format.encode('utf-8'), check=True)
+            
+            logging.info(f"Set clipboard with files: {', '.join(file_paths)}")
+            
+        except Exception as e:
+            logging.error(f"Error setting file to clipboard: {e}")
+
+    def get_clipboard_content(self):
+        try:
+            text_data = subprocess.run(['xsel', '-b', '-o'], 
+                                     capture_output=True, text=True).stdout.strip()
+            if text_data:
+                return {'type': 'text', 'data': text_data}
+            
+            try:
+                file_data = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
+                                         capture_output=True, text=True).stdout
+                if file_data:
+                    return self._process_files(file_data)
+            except:
+                pass
+                
+        except Exception as e:
+            logging.error(f"Clipboard error: {e}")
+        return None
+
+    def _process_files(self, file_data):
+        processed_files = []
+        for uri in file_data.strip().split('\n'):
+            if uri.startswith('file://'):
+                path = uri[7:].strip()
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'rb') as f:
+                            chunks = []
+                            while True:
+                                chunk = f.read(MAX_CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                chunks.append(base64.b64encode(chunk).decode('utf-8'))
+                            
+                        file_info = {
+                            'name': os.path.basename(path),
+                            'size': os.path.getsize(path),
+                            'data': ''.join(chunks)
+                        }
+                        processed_files.append(file_info)
+                    except Exception as e:
+                        logging.error(f"Error processing file {path}: {e}")
+                        continue
+        
+        if processed_files:
+            return {'type': 'files', 'files': processed_files}
+        return None
+
+    def set_clipboard_content(self, content):
+        try:
+            self._clear_clipboard()
+            
+            if content['type'] == 'text':
+                subprocess.run(['xsel', '-b', '-i'], 
+                             input=content['data'].encode('utf-8'), check=True)
+                logging.info("Text content set to clipboard")
+                
+            elif content['type'] == 'files':
+                self._cleanup_old_files()
+                
+                saved_paths = []
+                for file_info in content['files']:
+                    target_path = self.clipboard_dir / file_info['name']
+                    with open(target_path, 'wb') as f:
+                        f.write(base64.b64decode(file_info['data']))
+                    saved_paths.append(str(target_path.absolute()))
+                
+                if saved_paths:
+                    self._set_file_to_clipboard(saved_paths)
+                    logging.info(f"Files saved and added to clipboard")
+                
+        except Exception as e:
+            logging.error(f"Error setting clipboard: {e}")
+            self._clear_clipboard()
 
 class UnifiedServer:
     def __init__(self):
