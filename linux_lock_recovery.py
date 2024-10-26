@@ -11,6 +11,13 @@ import subprocess
 import os
 import pwd
 
+# Audio Configuration
+CHUNK = 1024
+FORMAT = pyaudio.paInt16
+CHANNELS = 2
+RATE = 44100
+AUDIO_PORT = 5001
+
 def get_user():
     """Get the actual username even when running with sudo"""
     return pwd.getpwuid(int(os.environ.get('SUDO_UID', os.getuid()))).pw_name
@@ -168,6 +175,7 @@ class AudioServer:
         self.audio = AudioHandler()
         self.server_socket = None
         
+        # Configure logging
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -180,6 +188,7 @@ class AudioServer:
     def signal_handler(self, signum, frame):
         logging.info("Shutdown signal received. Cleaning up...")
         self.stop()
+        sys.exit(0)
 
     def handle_client(self, client_socket, address):
         logging.info(f"New client connected from {address}")
@@ -197,6 +206,7 @@ class AudioServer:
                             self.audio.streams['output'].write(data)
                         except Exception as e:
                             logging.error(f"Error playing audio: {e}")
+                            break
                 except Exception as e:
                     logging.error(f"Error receiving audio from {address}: {e}")
                     break
@@ -210,6 +220,7 @@ class AudioServer:
                             client_socket.send(data)
                         except Exception as e:
                             logging.error(f"Error reading from input: {e}")
+                            break
                 except Exception as e:
                     logging.error(f"Error sending audio to {address}: {e}")
                     break
@@ -223,36 +234,49 @@ class AudioServer:
         receive_thread.join()
         send_thread.join()
         
-        self.clients.remove(client_socket)
-        client_socket.close()
+        if client_socket in self.clients:
+            self.clients.remove(client_socket)
+        try:
+            client_socket.close()
+        except:
+            pass
         logging.info(f"Client {address} disconnected")
 
     def start(self):
-        self.running = True
-        
         try:
             # Initialize audio services and streams
             self.audio.setup_streams()
             
+            # Create and setup server socket
             self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
-            self.server_socket.bind((self.host, AUDIO_PORT))
-            self.server_socket.listen(5)
-            logging.info(f"Audio server listening on {self.host}:{AUDIO_PORT}")
-            
-            while self.running:
-                try:
-                    client_socket, address = self.server_socket.accept()
-                    client_thread = threading.Thread(
-                        target=self.handle_client,
-                        args=(client_socket, address)
-                    )
-                    client_thread.start()
-                except Exception as e:
-                    if self.running:
-                        logging.error(f"Error accepting connection: {e}")
-                    
+            try:
+                self.server_socket.bind((self.host, AUDIO_PORT))
+                self.server_socket.listen(5)
+                logging.info(f"Audio server listening on {self.host}:{AUDIO_PORT}")
+                
+                self.running = True
+                
+                while self.running:
+                    try:
+                        client_socket, address = self.server_socket.accept()
+                        client_thread = threading.Thread(
+                            target=self.handle_client,
+                            args=(client_socket, address)
+                        )
+                        client_thread.start()
+                    except socket.error as e:
+                        if self.running:  # Only log if we're still meant to be running
+                            logging.error(f"Socket accept error: {e}")
+                    except Exception as e:
+                        if self.running:
+                            logging.error(f"Error accepting connection: {e}")
+                
+            except Exception as e:
+                logging.error(f"Server socket error: {e}")
+                raise
+                
         except Exception as e:
             logging.error(f"Server error: {e}")
         finally:
@@ -262,7 +286,7 @@ class AudioServer:
         self.running = False
         
         # Close all client connections
-        for client in self.clients:
+        for client in self.clients.copy():  # Use copy to avoid modification during iteration
             try:
                 client.close()
             except:
@@ -270,30 +294,20 @@ class AudioServer:
         self.clients.clear()
         
         # Close server socket
-        if self.server_socket:
+        if self.server_socket is not None:
             try:
                 self.server_socket.close()
             except:
                 pass
+            self.server_socket = None
             
         # Cleanup audio
-        self.audio.cleanup()
+        try:
+            self.audio.cleanup()
+        except:
+            pass
 
 if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    )
-
-    # Audio Configuration
-    CHUNK = 1024
-    FORMAT = pyaudio.paInt16
-    CHANNELS = 2
-    RATE = 44100
-    AUDIO_PORT = 5001
-
     # Check if root and handle permissions
     if os.geteuid() != 0:
         logging.error("This script must be run with sudo to properly initialize audio services")
@@ -305,3 +319,6 @@ if __name__ == "__main__":
     except Exception as e:
         logging.error(f"Fatal error: {e}")
         sys.exit(1)
+    except KeyboardInterrupt:
+        logging.info("Keyboard interrupt received, shutting down...")
+        sys.exit(0)
