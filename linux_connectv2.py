@@ -22,6 +22,95 @@ AUDIO_PORT = 5001
 MAX_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
 CLIPBOARD_CHECK_INTERVAL = 0.5  # How often to check clipboard for changes
 
+class AudioServer:
+    def __init__(self, host='0.0.0.0', port=AUDIO_PORT):
+        self.host = host
+        self.port = port
+        self.p = pyaudio.PyAudio()
+        self.audio_stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
+                                      input=True, frames_per_buffer=CHUNK)
+        self.clients = []
+        self.running = False
+        self.accept_thread = None
+        self.stream_thread = None
+
+    def start(self):
+        self.running = True
+        # Set up server socket
+        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.server_socket.bind((self.host, self.port))
+        self.server_socket.listen(5)
+        logging.info(f"Audio server listening on {self.host}:{self.port}")
+
+        # Start accept thread
+        self.accept_thread = threading.Thread(target=self.accept_clients)
+        self.accept_thread.daemon = True
+        self.accept_thread.start()
+
+        # Start streaming thread
+        self.stream_thread = threading.Thread(target=self.stream_audio)
+        self.stream_thread.daemon = True
+        self.stream_thread.start()
+
+    def stop(self):
+        self.running = False
+        # Close all client connections
+        for client in self.clients:
+            try:
+                client.close()
+            except:
+                pass
+        self.clients.clear()
+        
+        # Close server socket
+        try:
+            self.server_socket.close()
+        except:
+            pass
+            
+        # Close audio stream
+        try:
+            self.audio_stream.stop_stream()
+            self.audio_stream.close()
+            self.p.terminate()
+        except:
+            pass
+
+    def accept_clients(self):
+        while self.running:
+            try:
+                self.server_socket.settimeout(1.0)  # Allow checking running flag
+                client_socket, client_address = self.server_socket.accept()
+                logging.info(f"Audio client {client_address} connected")
+                self.clients.append(client_socket)
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    logging.error(f"Error accepting audio client: {e}")
+                break
+
+    def stream_audio(self):
+        while self.running:
+            try:
+                # Capture audio
+                audio_data = self.audio_stream.read(CHUNK, exception_on_overflow=False)
+                # Send to each connected client
+                for client in self.clients[:]:  # Create a copy of the list for iteration
+                    try:
+                        client.sendall(audio_data)
+                    except Exception as e:
+                        logging.error(f"Error sending audio to client: {e}")
+                        self.clients.remove(client)
+                        try:
+                            client.close()
+                        except:
+                            pass
+            except Exception as e:
+                if self.running:
+                    logging.error(f"Audio streaming error: {e}")
+
 class ClipboardHandler:
     def __init__(self):
         self.last_content = None
@@ -200,99 +289,11 @@ class ClipboardHandler:
             
             time.sleep(CLIPBOARD_CHECK_INTERVAL)
 
-class AudioServer:
-    def __init__(self, host='0.0.0.0', port=AUDIO_PORT):
-        self.host = host
-        self.port = port
-        self.p = pyaudio.PyAudio()
-        self.audio_stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                                      input=True, frames_per_buffer=CHUNK)
-        self.clients = []
-        self.running = False
-        self.accept_thread = None
-        self.stream_thread = None
-
-    def start(self):
-        self.running = True
-        # Set up server socket
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-        logging.info(f"Audio server listening on {self.host}:{self.port}")
-
-        # Start accept thread
-        self.accept_thread = threading.Thread(target=self.accept_clients)
-        self.accept_thread.daemon = True
-        self.accept_thread.start()
-
-        # Start streaming thread
-        self.stream_thread = threading.Thread(target=self.stream_audio)
-        self.stream_thread.daemon = True
-        self.stream_thread.start()
-
-    def stop(self):
-        self.running = False
-        # Close all client connections
-        for client in self.clients:
-            try:
-                client.close()
-            except:
-                pass
-        self.clients.clear()
-        
-        # Close server socket
-        try:
-            self.server_socket.close()
-        except:
-            pass
-            
-        # Close audio stream
-        try:
-            self.audio_stream.stop_stream()
-            self.audio_stream.close()
-            self.p.terminate()
-        except:
-            pass
-
-    def accept_clients(self):
-        while self.running:
-            try:
-                self.server_socket.settimeout(1.0)  # Allow checking running flag
-                client_socket, client_address = self.server_socket.accept()
-                logging.info(f"Audio client {client_address} connected")
-                self.clients.append(client_socket)
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    logging.error(f"Error accepting audio client: {e}")
-                break
-
-    def stream_audio(self):
-        while self.running:
-            try:
-                # Capture audio
-                audio_data = self.audio_stream.read(CHUNK, exception_on_overflow=False)
-                # Send to each connected client
-                for client in self.clients[:]:  # Create a copy of the list for iteration
-                    try:
-                        client.sendall(audio_data)
-                    except Exception as e:
-                        logging.error(f"Error sending audio to client: {e}")
-                        self.clients.remove(client)
-                        try:
-                            client.close()
-                        except:
-                            pass
-            except Exception as e:
-                if self.running:
-                    logging.error(f"Audio streaming error: {e}")
-
 class UnifiedServer:
     def __init__(self):
         self.running = False
         self.clipboard_handler = ClipboardHandler()
+        self.audio_server = AudioServer()
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
@@ -375,6 +376,9 @@ class UnifiedServer:
         # Start clipboard monitoring
         self.clipboard_handler.start_monitoring()
         
+        # Start audio server
+        self.audio_server.start()
+        
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clipboard_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -410,6 +414,9 @@ class UnifiedServer:
             
         # Stop clipboard monitoring
         self.clipboard_handler.stop_monitoring()
+        
+        # Stop audio server
+        self.audio_server.stop()
         
         clipboard_server.close()
         clipboard_thread.join()
