@@ -20,6 +20,7 @@ HOST = '0.0.0.0'  # Listen on all interfaces
 CLIPBOARD_PORT = 5000
 AUDIO_PORT = 5001
 MAX_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
+CLIPBOARD_CHECK_INTERVAL = 0.5  # How often to check clipboard for changes
 
 class ClipboardHandler:
     def __init__(self):
@@ -27,6 +28,9 @@ class ClipboardHandler:
         self.clipboard_dir = Path.home() / 'ClipboardSync'
         self.clipboard_dir.mkdir(exist_ok=True)
         self.clients = set()
+        self.monitoring = False
+        self.monitor_thread = None
+        self.last_hash = None
         
     def _clear_clipboard(self):
         try:
@@ -116,7 +120,7 @@ class ClipboardHandler:
             return {'type': 'files', 'files': processed_files}
         return None
 
-    def set_clipboard_content(self, content):
+    def set_clipboard_content(self, content, from_monitor=False):
         try:
             self._clear_clipboard()
             
@@ -138,11 +142,63 @@ class ClipboardHandler:
                 if saved_paths:
                     self._set_file_to_clipboard(saved_paths)
                     logging.info(f"Files saved and added to clipboard")
+
+            # If this change wasn't from the monitor, update last_hash to prevent re-broadcasting
+            if not from_monitor:
+                self.last_hash = self._get_content_hash(content)
                 
         except Exception as e:
             logging.error(f"Error setting clipboard: {e}")
             self._clear_clipboard()
 
+    def _get_content_hash(self, content):
+        """Generate a hash of clipboard content for change detection"""
+        if content is None:
+            return None
+        if content['type'] == 'text':
+            return hash(content['data'])
+        elif content['type'] == 'files':
+            return hash(tuple(f['name'] + str(f['size']) for f in content['files']))
+        return None
+
+    def start_monitoring(self):
+        """Start monitoring clipboard for changes"""
+        self.monitoring = True
+        self.monitor_thread = threading.Thread(target=self._monitor_clipboard)
+        self.monitor_thread.daemon = True
+        self.monitor_thread.start()
+
+    def stop_monitoring(self):
+        """Stop monitoring clipboard"""
+        self.monitoring = False
+        if self.monitor_thread:
+            self.monitor_thread.join()
+
+    def _monitor_clipboard(self):
+        """Monitor clipboard for changes and broadcast to clients"""
+        while self.monitoring:
+            try:
+                current_content = self.get_clipboard_content()
+                current_hash = self._get_content_hash(current_content)
+                
+                if current_hash != self.last_hash and current_content:
+                    self.last_hash = current_hash
+                    
+                    # Broadcast to all clients
+                    message = json.dumps(current_content)
+                    encoded_message = f"{len(message)}:{message}".encode('utf-8')
+                    
+                    for client in self.clients.copy():
+                        try:
+                            client.sendall(encoded_message)
+                        except Exception as e:
+                            logging.error(f"Error broadcasting to client: {e}")
+                            self.clients.remove(client)
+                
+            except Exception as e:
+                logging.error(f"Error in clipboard monitor: {e}")
+            
+            time.sleep(CLIPBOARD_CHECK_INTERVAL)
 
 class UnifiedServer:
     def __init__(self):
@@ -227,6 +283,9 @@ class UnifiedServer:
     def start(self):
         self.running = True
         
+        # Start clipboard monitoring
+        self.clipboard_handler.start_monitoring()
+        
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clipboard_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -249,8 +308,8 @@ class UnifiedServer:
                 except Exception as e:
                     if self.running:
                         logging.error(f"Clipboard server error: {e}")
-        clipboard_thread = threading.Thread(target=handle_clipboard_connections)
         
+        clipboard_thread = threading.Thread(target=handle_clipboard_connections)
         clipboard_thread.start()
         
         try:
@@ -260,8 +319,10 @@ class UnifiedServer:
             logging.info("Shutting down server...")
             self.running = False
             
-        clipboard_server.close()
+        # Stop clipboard monitoring
+        self.clipboard_handler.stop_monitoring()
         
+        clipboard_server.close()
         clipboard_thread.join()
         
         logging.info("Server shutdown complete")
