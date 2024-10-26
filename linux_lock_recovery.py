@@ -9,51 +9,68 @@ import signal
 import sys
 import subprocess
 import os
+import pwd
 
-# Audio Configuration
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 2
-RATE = 44100
-AUDIO_PORT = 5001
+def get_user():
+    """Get the actual username even when running with sudo"""
+    return pwd.getpwuid(int(os.environ.get('SUDO_UID', os.getuid()))).pw_name
 
 def setup_audio_services():
-    """Initialize and restart audio services"""
+    """Initialize and restart audio services for Kali Linux"""
     try:
         logging.info("Setting up audio services...")
+        username = get_user()
         
-        # Kill any existing PulseAudio processes
-        subprocess.run(['pulseaudio', '-k'], stderr=subprocess.PIPE)
-        time.sleep(1)
-        
-        # Start PulseAudio if not running
-        subprocess.run(['pulseaudio', '--start'], stderr=subprocess.PIPE)
-        time.sleep(2)
-        
-        # Restart PipeWire services
-        commands = [
-            'systemctl --user restart pipewire',
-            'systemctl --user restart pipewire-pulse',
-            'systemctl --user restart pulseaudio'
-        ]
-        
-        for cmd in commands:
-            try:
-                subprocess.run(cmd.split(), stderr=subprocess.PIPE)
-                time.sleep(1)
-            except Exception as e:
-                logging.warning(f"Command failed: {cmd} - {e}")
-        
-        # Load audio modules if needed
-        subprocess.run(['pactl', 'load-module', 'module-null-sink'], stderr=subprocess.PIPE)
-        
-        # Test audio system
+        # Stop any existing PulseAudio processes
         try:
-            subprocess.run(['pactl', 'info'], check=True, stdout=subprocess.PIPE)
-            logging.info("Audio services initialized successfully")
-        except subprocess.CalledProcessError:
-            logging.error("Failed to verify audio system")
+            subprocess.run(['pulseaudio', '--kill'], stderr=subprocess.PIPE)
+            time.sleep(1)
+        except:
+            pass
+
+        # Make sure the PulseAudio directory exists
+        pulse_dir = f"/home/{username}/.config/pulse"
+        os.makedirs(pulse_dir, exist_ok=True)
+        
+        # Set proper ownership if running as root
+        if os.geteuid() == 0:
+            uid = int(os.environ.get('SUDO_UID', os.getuid()))
+            gid = int(os.environ.get('SUDO_GID', os.getgid()))
+            os.chown(pulse_dir, uid, gid)
+
+        # Start PulseAudio server
+        try:
+            env = os.environ.copy()
+            if os.geteuid() == 0:
+                env['HOME'] = f"/home/{username}"
+                env['USER'] = username
+                env['PULSE_RUNTIME_PATH'] = f"/run/user/{uid}/pulse"
+            
+            start_cmd = ['pulseaudio', '--start', '--log-target=syslog']
+            subprocess.run(start_cmd, env=env, stderr=subprocess.PIPE)
+            time.sleep(2)
+            
+            # Load required modules
+            subprocess.run(['pacmd', 'load-module', 'module-null-sink'], stderr=subprocess.PIPE)
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"Error starting PulseAudio: {e}")
             raise
+
+        # Verify audio system is working
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                subprocess.run(['pactl', 'info'], check=True, capture_output=True)
+                logging.info("Audio services initialized successfully")
+                return
+            except subprocess.CalledProcessError:
+                if attempt < max_attempts - 1:
+                    logging.warning(f"PulseAudio not ready, attempt {attempt + 1}/{max_attempts}")
+                    time.sleep(2)
+                else:
+                    logging.error("Failed to verify audio system after multiple attempts")
+                    raise
             
     except Exception as e:
         logging.error(f"Error setting up audio services: {e}")
@@ -73,25 +90,46 @@ class AudioHandler:
             # List available devices for debugging
             self.list_devices()
             
-            self.streams['input'] = self.p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                input=True,
-                input_device_index=0,
-                frames_per_buffer=CHUNK
-            )
-            logging.info("Input stream setup successfully using PulseAudio")
+            # Find the PulseAudio device
+            pulse_input_index = None
+            pulse_output_index = None
             
-            self.streams['output'] = self.p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
-                output=True,
-                output_device_index=0,
-                frames_per_buffer=CHUNK
-            )
-            logging.info("Output stream setup successfully using PulseAudio")
+            for i in range(self.p.get_device_count()):
+                try:
+                    device_info = self.p.get_device_info_by_index(i)
+                    if 'pulse' in device_info['name'].lower():
+                        if device_info['maxInputChannels'] > 0:
+                            pulse_input_index = i
+                        if device_info['maxOutputChannels'] > 0:
+                            pulse_output_index = i
+                except Exception as e:
+                    logging.error(f"Error checking device {i}: {e}")
+
+            if pulse_input_index is not None:
+                self.streams['input'] = self.p.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    input_device_index=pulse_input_index,
+                    frames_per_buffer=CHUNK
+                )
+                logging.info("Input stream setup successfully")
+            else:
+                logging.error("No PulseAudio input device found")
+                
+            if pulse_output_index is not None:
+                self.streams['output'] = self.p.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    output=True,
+                    output_device_index=pulse_output_index,
+                    frames_per_buffer=CHUNK
+                )
+                logging.info("Output stream setup successfully")
+            else:
+                logging.error("No PulseAudio output device found")
             
         except Exception as e:
             logging.error(f"Error setting up streams: {e}")
@@ -242,10 +280,28 @@ class AudioServer:
         self.audio.cleanup()
 
 if __name__ == "__main__":
-    # Ensure script is run with sudo if needed
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    # Audio Configuration
+    CHUNK = 1024
+    FORMAT = pyaudio.paInt16
+    CHANNELS = 2
+    RATE = 44100
+    AUDIO_PORT = 5001
+
+    # Check if root and handle permissions
     if os.geteuid() != 0:
-        logging.warning("This script might need sudo privileges to manage audio services")
-        logging.warning("If you experience issues, try running with sudo")
-    
-    server = AudioServer()
-    server.start()
+        logging.error("This script must be run with sudo to properly initialize audio services")
+        sys.exit(1)
+
+    try:
+        server = AudioServer()
+        server.start()
+    except Exception as e:
+        logging.error(f"Fatal error: {e}")
+        sys.exit(1)
