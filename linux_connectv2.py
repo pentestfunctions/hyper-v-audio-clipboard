@@ -8,10 +8,15 @@ import os
 import json
 import pyaudio
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import sys
+import traceback
+import zlib
+from typing import Dict, Set, Optional
+from datetime import datetime
 
-# Configuration
+# Server Configuration
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
@@ -20,308 +25,225 @@ HOST = '0.0.0.0'  # Listen on all interfaces
 CLIPBOARD_PORT = 5000
 AUDIO_PORT = 5001
 MAX_CHUNK_SIZE = 1024 * 1024  # 1MB chunks for large files
-CLIPBOARD_CHECK_INTERVAL = 0.5  # How often to check clipboard for changes
+MAX_CLIENTS = 50
+SOCKET_TIMEOUT = 30
+KEEP_ALIVE_INTERVAL = 1.0
 
-class AudioServer:
-    def __init__(self, host='0.0.0.0', port=AUDIO_PORT):
-        self.host = host
-        self.port = port
-        self.p = pyaudio.PyAudio()
-        self.audio_stream = self.p.open(format=FORMAT, channels=CHANNELS, rate=RATE,
-                                      input=True, frames_per_buffer=CHUNK)
-        self.clients = []
-        self.running = False
-        self.accept_thread = None
-        self.stream_thread = None
+class ServerStats:
+    def __init__(self):
+        self.start_time = datetime.now()
+        self.total_bytes_transferred = 0
+        self.total_files_transferred = 0
+        self.peak_connected_clients = 0
+        self.current_connected_clients = 0
+        self._lock = threading.Lock()
 
-    def start(self):
-        self.running = True
-        # Set up server socket
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((self.host, self.port))
-        self.server_socket.listen(5)
-        logging.info(f"Audio server listening on {self.host}:{self.port}")
+    def update_bytes(self, bytes_count: int):
+        with self._lock:
+            self.total_bytes_transferred += bytes_count
 
-        # Start accept thread
-        self.accept_thread = threading.Thread(target=self.accept_clients)
-        self.accept_thread.daemon = True
-        self.accept_thread.start()
+    def update_files(self, count: int = 1):
+        with self._lock:
+            self.total_files_transferred += count
 
-        # Start streaming thread
-        self.stream_thread = threading.Thread(target=self.stream_audio)
-        self.stream_thread.daemon = True
-        self.stream_thread.start()
+    def update_clients(self, current_count: int):
+        with self._lock:
+            self.current_connected_clients = current_count
+            self.peak_connected_clients = max(self.peak_connected_clients, current_count)
 
-    def stop(self):
-        self.running = False
-        # Close all client connections
-        for client in self.clients:
-            try:
-                client.close()
-            except:
-                pass
-        self.clients.clear()
-        
-        # Close server socket
-        try:
-            self.server_socket.close()
-        except:
-            pass
-            
-        # Close audio stream
-        try:
-            self.audio_stream.stop_stream()
-            self.audio_stream.close()
-            self.p.terminate()
-        except:
-            pass
-
-    def accept_clients(self):
-        while self.running:
-            try:
-                self.server_socket.settimeout(1.0)  # Allow checking running flag
-                client_socket, client_address = self.server_socket.accept()
-                logging.info(f"Audio client {client_address} connected")
-                self.clients.append(client_socket)
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    logging.error(f"Error accepting audio client: {e}")
-                break
-
-    def stream_audio(self):
-        while self.running:
-            try:
-                # Capture audio
-                audio_data = self.audio_stream.read(CHUNK, exception_on_overflow=False)
-                # Send to each connected client
-                for client in self.clients[:]:  # Create a copy of the list for iteration
-                    try:
-                        client.sendall(audio_data)
-                    except Exception as e:
-                        logging.error(f"Error sending audio to client: {e}")
-                        self.clients.remove(client)
-                        try:
-                            client.close()
-                        except:
-                            pass
-            except Exception as e:
-                if self.running:
-                    logging.error(f"Audio streaming error: {e}")
+    def get_stats(self) -> dict:
+        with self._lock:
+            return {
+                'uptime': str(datetime.now() - self.start_time),
+                'total_data_transferred': f"{self.total_bytes_transferred / (1024*1024):.2f} MB",
+                'files_transferred': self.total_files_transferred,
+                'current_clients': self.current_connected_clients,
+                'peak_clients': self.peak_connected_clients
+            }
 
 class ClipboardHandler:
     def __init__(self):
         self.last_content = None
         self.clipboard_dir = Path.home() / 'ClipboardSync'
         self.clipboard_dir.mkdir(exist_ok=True)
-        self.clients = set()
-        self.monitoring = False
-        self.monitor_thread = None
-        self.last_hash = None
+        self.clients: Set[socket.socket] = set()
+        self._lock = threading.Lock()
         
-    def _clear_clipboard(self):
-        try:
-            subprocess.run(['xsel', '-b', '-c'], check=True)
-            subprocess.run(['xclip', '-selection', 'clipboard', '-i'], input=b'', check=True)
-        except Exception as e:
-            logging.error(f"Error clearing clipboard: {e}")
+    def add_client(self, client: socket.socket):
+        with self._lock:
+            self.clients.add(client)
+            
+    def remove_client(self, client: socket.socket):
+        with self._lock:
+            if client in self.clients:
+                self.clients.remove(client)
+                
+    def broadcast(self, sender: socket.socket, message: bytes):
+        with self._lock:
+            dead_clients = set()
+            for client in self.clients:
+                if client != sender:
+                    try:
+                        client.sendall(message)
+                    except Exception as e:
+                        logging.error(f"Error broadcasting to client: {e}")
+                        dead_clients.add(client)
+            
+            # Cleanup dead clients
+            for client in dead_clients:
+                self.remove_client(client)
 
-    def _cleanup_old_files(self):
+class AudioServer:
+    def __init__(self, host: str = HOST, port: int = AUDIO_PORT):
+        self.host = host
+        self.port = port
+        self.p = pyaudio.PyAudio()
+        self.clients: list = []
+        self.running = False
+        self.server_socket: Optional[socket.socket] = None
+        self._lock = threading.Lock()
+
+    def add_client(self, client: socket.socket):
+        with self._lock:
+            self.clients.append(client)
+            
+    def remove_client(self, client: socket.socket):
+        with self._lock:
+            if client in self.clients:
+                self.clients.remove(client)
+
+    def broadcast_audio(self, sender: socket.socket, audio_data: bytes):
+        with self._lock:
+            dead_clients = []
+            for client in self.clients:
+                if client != sender:
+                    try:
+                        client.sendall(audio_data)
+                    except Exception as e:
+                        logging.error(f"Error broadcasting audio to client: {e}")
+                        dead_clients.append(client)
+            
+            # Cleanup dead clients
+            for client in dead_clients:
+                self.remove_client(client)
+
+    def handle_client(self, client_socket: socket.socket, address: str):
+        logging.info(f"New audio client connected: {address}")
+        self.add_client(client_socket)
+        
         try:
-            for file_path in self.clipboard_dir.glob('*'):
+            while self.running:
                 try:
-                    if file_path.is_file():
-                        file_path.unlink()
+                    audio_data = client_socket.recv(CHUNK * 4)
+                    if not audio_data:
+                        break
+                    self.broadcast_audio(client_socket, audio_data)
                 except Exception as e:
-                    logging.error(f"Error deleting file {file_path}: {e}")
-        except Exception as e:
-            logging.error(f"Error cleaning up directory: {e}")
-
-    def _set_file_to_clipboard(self, file_paths):
-        try:
-            uri_list = '\n'.join([f"file://{path}" for path in file_paths])
-            
-            # Set with xclip for URI list
-            subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-i'], 
-                         input=uri_list.encode('utf-8'), check=True)
-            
-            # Set with xsel as backup
-            subprocess.run(['xsel', '-b', '-i'], input=uri_list.encode('utf-8'), check=True)
-            
-            # Set GNOME format
-            gnome_format = f"copy\n{uri_list}"
-            subprocess.run(['xclip', '-selection', 'clipboard', 
-                          '-t', 'x-special/gnome-copied-files', '-i'], 
-                         input=gnome_format.encode('utf-8'), check=True)
-            
-            logging.info(f"Set clipboard with files: {', '.join(file_paths)}")
-            
-        except Exception as e:
-            logging.error(f"Error setting file to clipboard: {e}")
-
-    def get_clipboard_content(self):
-        try:
-            text_data = subprocess.run(['xsel', '-b', '-o'], 
-                                     capture_output=True, text=True).stdout.strip()
-            if text_data:
-                return {'type': 'text', 'data': text_data}
-            
+                    logging.error(f"Error handling audio client: {e}")
+                    break
+        finally:
+            self.remove_client(client_socket)
             try:
-                file_data = subprocess.run(['xclip', '-selection', 'clipboard', '-t', 'text/uri-list', '-o'], 
-                                         capture_output=True, text=True).stdout
-                if file_data:
-                    return self._process_files(file_data)
+                client_socket.close()
             except:
                 pass
-                
-        except Exception as e:
-            logging.error(f"Clipboard error: {e}")
-        return None
+            logging.info(f"Audio client disconnected: {address}")
 
-    def _process_files(self, file_data):
-        processed_files = []
-        for uri in file_data.strip().split('\n'):
-            if uri.startswith('file://'):
-                path = uri[7:].strip()
-                if os.path.exists(path):
-                    try:
-                        with open(path, 'rb') as f:
-                            chunks = []
-                            while True:
-                                chunk = f.read(MAX_CHUNK_SIZE)
-                                if not chunk:
-                                    break
-                                chunks.append(base64.b64encode(chunk).decode('utf-8'))
-                            
-                        file_info = {
-                            'name': os.path.basename(path),
-                            'size': os.path.getsize(path),
-                            'data': ''.join(chunks)
-                        }
-                        processed_files.append(file_info)
-                    except Exception as e:
-                        logging.error(f"Error processing file {path}: {e}")
-                        continue
-        
-        if processed_files:
-            return {'type': 'files', 'files': processed_files}
-        return None
-
-    def set_clipboard_content(self, content, from_monitor=False):
+    def start(self):
+        self.running = True
         try:
-            self._clear_clipboard()
-            
-            if content['type'] == 'text':
-                subprocess.run(['xsel', '-b', '-i'], 
-                             input=content['data'].encode('utf-8'), check=True)
-                logging.info("Text content set to clipboard")
-                
-            elif content['type'] == 'files':
-                self._cleanup_old_files()
-                
-                saved_paths = []
-                for file_info in content['files']:
-                    target_path = self.clipboard_dir / file_info['name']
-                    with open(target_path, 'wb') as f:
-                        f.write(base64.b64decode(file_info['data']))
-                    saved_paths.append(str(target_path.absolute()))
-                
-                if saved_paths:
-                    self._set_file_to_clipboard(saved_paths)
-                    logging.info(f"Files saved and added to clipboard")
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind((self.host, self.port))
+            self.server_socket.listen(MAX_CLIENTS)
+            logging.info(f"Audio server listening on {self.host}:{self.port}")
 
-            # If this change wasn't from the monitor, update last_hash to prevent re-broadcasting
-            if not from_monitor:
-                self.last_hash = self._get_content_hash(content)
-                
+            while self.running:
+                try:
+                    client_socket, address = self.server_socket.accept()
+                    thread = threading.Thread(
+                        target=self.handle_client,
+                        args=(client_socket, address),
+                        name=f"AudioClient-{address}"
+                    )
+                    thread.daemon = True
+                    thread.start()
+                except Exception as e:
+                    if self.running:
+                        logging.error(f"Error accepting audio client: {e}")
+
         except Exception as e:
-            logging.error(f"Error setting clipboard: {e}")
-            self._clear_clipboard()
+            logging.error(f"Error in audio server: {e}")
+        finally:
+            self.cleanup()
 
-    def _get_content_hash(self, content):
-        """Generate a hash of clipboard content for change detection"""
-        if content is None:
-            return None
-        if content['type'] == 'text':
-            return hash(content['data'])
-        elif content['type'] == 'files':
-            return hash(tuple(f['name'] + str(f['size']) for f in content['files']))
-        return None
+    def stop(self):
+        self.running = False
+        self.cleanup()
 
-    def start_monitoring(self):
-        """Start monitoring clipboard for changes"""
-        self.monitoring = True
-        self.monitor_thread = threading.Thread(target=self._monitor_clipboard)
-        self.monitor_thread.daemon = True
-        self.monitor_thread.start()
+    def cleanup(self):
+        # Close all client connections
+        with self._lock:
+            for client in self.clients[:]:
+                try:
+                    client.close()
+                except:
+                    pass
+            self.clients.clear()
 
-    def stop_monitoring(self):
-        """Stop monitoring clipboard"""
-        self.monitoring = False
-        if self.monitor_thread:
-            self.monitor_thread.join()
-
-    def _monitor_clipboard(self):
-        """Monitor clipboard for changes and broadcast to clients"""
-        while self.monitoring:
+        # Close server socket
+        if self.server_socket:
             try:
-                current_content = self.get_clipboard_content()
-                current_hash = self._get_content_hash(current_content)
-                
-                if current_hash != self.last_hash and current_content:
-                    self.last_hash = current_hash
-                    
-                    # Broadcast to all clients
-                    message = json.dumps(current_content)
-                    encoded_message = f"{len(message)}:{message}".encode('utf-8')
-                    
-                    for client in self.clients.copy():
-                        try:
-                            client.sendall(encoded_message)
-                        except Exception as e:
-                            logging.error(f"Error broadcasting to client: {e}")
-                            self.clients.remove(client)
-                
-            except Exception as e:
-                logging.error(f"Error in clipboard monitor: {e}")
-            
-            time.sleep(CLIPBOARD_CHECK_INTERVAL)
+                self.server_socket.close()
+            except:
+                pass
 
 class UnifiedServer:
     def __init__(self):
         self.running = False
         self.clipboard_handler = ClipboardHandler()
         self.audio_server = AudioServer()
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
+        self.stats = ServerStats()
+        self.setup_logging()
+
+    def setup_logging(self):
+        log_dir = Path.home() / 'ClipboardSync' / 'logs'
+        log_dir.mkdir(exist_ok=True, parents=True)
+        
+        log_file = log_dir / f"server_{datetime.now().strftime('%Y%m%d')}.log"
+        
+        # Setup rotating file handler
+        handler = RotatingFileHandler(
+            log_file,
+            maxBytes=5*1024*1024,  # 5MB
+            backupCount=5
+        )
+        
+        formatter = logging.Formatter(
+            '%(asctime)s - %(levelname)s - [%(threadName)s] %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
         )
+        
+        handler.setFormatter(formatter)
+        
+        logger = logging.getLogger()
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        
+        # Also log to console
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
+        
+        logging.info("Server logging initialized")
 
-    def get_local_ip(self):
-        """Get all local IP addresses"""
-        ips = []
-        try:
-            interfaces = socket.getaddrinfo(
-                host=socket.gethostname(),
-                port=None,
-                family=socket.AF_INET
-            )
-            ips = sorted(list(set(ip[4][0] for ip in interfaces if not ip[4][0].startswith('127.'))))
-        except Exception as e:
-            logging.error(f"Error getting local IPs: {e}")
-            ips = ['0.0.0.0']
-        return ips
-
-    def handle_clipboard_client(self, client_socket, address):
+    def handle_clipboard_client(self, client_socket: socket.socket, address: str):
         logging.info(f"New clipboard connection from {address}")
-        self.clipboard_handler.clients.add(client_socket)
+        self.clipboard_handler.add_client(client_socket)
+        self.stats.update_clients(len(self.clipboard_handler.clients))
         
         try:
             while self.running:
-                # Handle incoming data
                 try:
                     client_socket.settimeout(0.1)
                     header = b""
@@ -342,19 +264,21 @@ class UnifiedServer:
                         data += chunk
                         remaining -= len(chunk)
                     
+                    # Update transfer statistics
+                    self.stats.update_bytes(len(data))
+                    
                     content = json.loads(data.decode('utf-8'))
                     
-                    if content.get('type'):
-                        self.clipboard_handler.set_clipboard_content(content)
-                        
-                        # Broadcast to other clients
-                        message = f"{len(data)}:{data.decode('utf-8')}".encode('utf-8')
-                        for other_client in self.clipboard_handler.clients:
-                            if other_client != client_socket:
-                                try:
-                                    other_client.sendall(message)
-                                except Exception as e:
-                                    logging.error(f"Error broadcasting to client: {e}")
+                    # Handle keep-alive messages
+                    if content.get('type') == 'keep_alive':
+                        continue
+                    
+                    # Broadcast to other clients
+                    message = f"{len(data)}:{data.decode('utf-8')}".encode('utf-8')
+                    self.clipboard_handler.broadcast(client_socket, message)
+                    
+                    if content.get('type') == 'files':
+                        self.stats.update_files(len(content.get('files', [])))
                                 
                 except socket.timeout:
                     pass
@@ -366,62 +290,118 @@ class UnifiedServer:
                 
         except Exception as e:
             logging.error(f"Clipboard client error: {e}")
+            logging.debug(f"Client error details: {traceback.format_exc()}")
         finally:
-            self.clipboard_handler.clients.remove(client_socket)
-            client_socket.close()
+            self.clipboard_handler.remove_client(client_socket)
+            self.stats.update_clients(len(self.clipboard_handler.clients))
+            try:
+                client_socket.close()
+            except:
+                pass
+            logging.info(f"Clipboard client disconnected: {address}")
+
+    def get_local_ip(self) -> list:
+        """Get all local IP addresses"""
+        ips = []
+        try:
+            interfaces = socket.getaddrinfo(
+                host=socket.gethostname(),
+                port=None,
+                family=socket.AF_INET
+            )
+            ips = sorted(list(set(ip[4][0] for ip in interfaces if not ip[4][0].startswith('127.'))))
+        except Exception as e:
+            logging.error(f"Error getting local IPs: {e}")
+            ips = ['0.0.0.0']
+        return ips
+
+    def log_server_stats(self):
+        """Periodically log server statistics"""
+        while self.running:
+            stats = self.stats.get_stats()
+            logging.info("Server Statistics:")
+            for key, value in stats.items():
+                logging.info(f"  {key}: {value}")
+            time.sleep(300)  # Log every 5 minutes
 
     def start(self):
         self.running = True
         
-        # Start clipboard monitoring
-        self.clipboard_handler.start_monitoring()
+        # Start stats logging thread
+        stats_thread = threading.Thread(
+            target=self.log_server_stats,
+            name="StatsLogger"
+        )
+        stats_thread.daemon = True
+        stats_thread.start()
         
         # Start audio server
-        self.audio_server.start()
+        audio_thread = threading.Thread(
+            target=self.audio_server.start,
+            name="AudioServer"
+        )
+        audio_thread.daemon = True
+        audio_thread.start()
         
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         clipboard_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        clipboard_server.bind(('0.0.0.0', CLIPBOARD_PORT))
-        clipboard_server.listen(5)
+        clipboard_server.bind((HOST, CLIPBOARD_PORT))
+        clipboard_server.listen(MAX_CLIENTS)
         
         local_ips = self.get_local_ip()
         logging.info("Server started on:")
         for ip in local_ips:
             logging.info(f"  {ip} - Clipboard port: {CLIPBOARD_PORT}, Audio port: {AUDIO_PORT}")
         
-        def handle_clipboard_connections():
+        try:
             while self.running:
                 try:
                     client_socket, address = clipboard_server.accept()
-                    logging.info(f"New clipboard connection from {address}")
-                    thread = threading.Thread(target=self.handle_clipboard_client,
-                                           args=(client_socket, address))
+                    if len(self.clipboard_handler.clients) >= MAX_CLIENTS:
+                        logging.warning(f"Maximum clients reached, rejecting connection from {address}")
+                        client_socket.close()
+                        continue
+                        
+                    thread = threading.Thread(
+                        target=self.handle_clipboard_client,
+                        args=(client_socket, address),
+                        name=f"ClipboardClient-{address}"
+                    )
+                    thread.daemon = True
                     thread.start()
                 except Exception as e:
                     if self.running:
-                        logging.error(f"Clipboard server error: {e}")
-        
-        clipboard_thread = threading.Thread(target=handle_clipboard_connections)
-        clipboard_thread.start()
-        
-        try:
-            while self.running:
+                        logging.error(f"Error accepting clipboard client: {e}")
+                        logging.debug(f"Accept error details: {traceback.format_exc()}")
+                
                 time.sleep(0.1)
+                
         except KeyboardInterrupt:
             logging.info("Shutting down server...")
+        except Exception as e:
+            logging.error(f"Server error: {e}")
+            logging.debug(f"Server error details: {traceback.format_exc()}")
+        finally:
             self.running = False
             
-        # Stop clipboard monitoring
-        self.clipboard_handler.stop_monitoring()
-        
-        # Stop audio server
-        self.audio_server.stop()
-        
-        clipboard_server.close()
-        clipboard_thread.join()
-        
-        logging.info("Server shutdown complete")
+            # Stop audio server
+            self.audio_server.stop()
+            
+            # Close all clipboard clients
+            for client in list(self.clipboard_handler.clients):
+                try:
+                    client.close()
+                except:
+                    pass
+            
+            # Close clipboard server
+            try:
+                clipboard_server.close()
+            except:
+                pass
+            
+            logging.info("Server shutdown complete")
 
 if __name__ == "__main__":
     server = UnifiedServer()
