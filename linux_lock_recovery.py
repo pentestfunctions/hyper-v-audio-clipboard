@@ -8,7 +8,7 @@ from queue import Queue
 import signal
 import sys
 
-# Audio Configuration (matching client settings)
+# Audio Configuration
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
@@ -19,29 +19,99 @@ class AudioHandler:
     def __init__(self):
         self.p = pyaudio.PyAudio()
         self.streams = {'input': None, 'output': None}
+        self.input_device_index = None
+        self.output_device_index = None
+        
+    def list_devices(self):
+        """List all available audio devices"""
+        info = []
+        for i in range(self.p.get_device_count()):
+            try:
+                device_info = self.p.get_device_info_by_index(i)
+                info.append(f"Device {i}: {device_info['name']}")
+                info.append(f"  Input channels: {device_info['maxInputChannels']}")
+                info.append(f"  Output channels: {device_info['maxOutputChannels']}")
+                info.append(f"  Default SampleRate: {device_info['defaultSampleRate']}")
+                info.append("")
+            except Exception as e:
+                info.append(f"Error getting device {i} info: {e}")
+        return '\n'.join(info)
         
     def setup_streams(self):
-        self.streams['input'] = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK
-        )
+        """Setup audio streams with detailed error reporting"""
+        logging.info("Available audio devices:\n" + self.list_devices())
         
-        self.streams['output'] = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            output=True,
-            frames_per_buffer=CHUNK
-        )
+        # Try to find default devices
+        try:
+            default_input = self.p.get_default_input_device_info()
+            self.input_device_index = default_input['index']
+            logging.info(f"Using default input device: {default_input['name']}")
+        except Exception as e:
+            logging.warning(f"Could not get default input device: {e}")
+            # Try to find any available input device
+            for i in range(self.p.get_device_count()):
+                device_info = self.p.get_device_info_by_index(i)
+                if device_info['maxInputChannels'] > 0:
+                    self.input_device_index = i
+                    logging.info(f"Found alternative input device: {device_info['name']}")
+                    break
+        
+        try:
+            default_output = self.p.get_default_output_device_info()
+            self.output_device_index = default_output['index']
+            logging.info(f"Using default output device: {default_output['name']}")
+        except Exception as e:
+            logging.warning(f"Could not get default output device: {e}")
+            # Try to find any available output device
+            for i in range(self.p.get_device_count()):
+                device_info = self.p.get_device_info_by_index(i)
+                if device_info['maxOutputChannels'] > 0:
+                    self.output_device_index = i
+                    logging.info(f"Found alternative output device: {device_info['name']}")
+                    break
+
+        # Setup input stream with error handling
+        try:
+            if self.input_device_index is not None:
+                self.streams['input'] = self.p.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    input=True,
+                    input_device_index=self.input_device_index,
+                    frames_per_buffer=CHUNK
+                )
+                logging.info("Input stream setup successfully")
+            else:
+                logging.error("No suitable input device found")
+        except Exception as e:
+            logging.error(f"Error setting up input stream: {e}")
+
+        # Setup output stream with error handling
+        try:
+            if self.output_device_index is not None:
+                self.streams['output'] = self.p.open(
+                    format=FORMAT,
+                    channels=CHANNELS,
+                    rate=RATE,
+                    output=True,
+                    output_device_index=self.output_device_index,
+                    frames_per_buffer=CHUNK
+                )
+                logging.info("Output stream setup successfully")
+            else:
+                logging.error("No suitable output device found")
+        except Exception as e:
+            logging.error(f"Error setting up output stream: {e}")
 
     def cleanup(self):
         for stream in self.streams.values():
             if stream:
-                stream.stop_stream()
-                stream.close()
+                try:
+                    stream.stop_stream()
+                    stream.close()
+                except Exception as e:
+                    logging.error(f"Error closing stream: {e}")
         self.p.terminate()
 
 class AudioServer:
@@ -50,7 +120,6 @@ class AudioServer:
         self.running = False
         self.clients = set()
         self.audio = AudioHandler()
-        self.audio_queue = Queue()
         
         logging.basicConfig(
             level=logging.INFO,
@@ -58,7 +127,6 @@ class AudioServer:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # Setup signal handler for graceful shutdown
         signal.signal(signal.SIGINT, self.signal_handler)
         signal.signal(signal.SIGTERM, self.signal_handler)
 
@@ -77,11 +145,12 @@ class AudioServer:
                     if not data:
                         break
                     
-                    # Play received audio locally
                     if self.audio.streams['output']:
-                        self.audio.streams['output'].write(data)
+                        try:
+                            self.audio.streams['output'].write(data)
+                        except Exception as e:
+                            logging.error(f"Error playing audio: {e}")
                     
-                    # Forward audio to other clients
                     for other_client in self.clients:
                         if other_client != client_socket:
                             try:
@@ -96,8 +165,11 @@ class AudioServer:
             while self.running:
                 try:
                     if self.audio.streams['input']:
-                        data = self.audio.streams['input'].read(CHUNK, exception_on_overflow=False)
-                        client_socket.send(data)
+                        try:
+                            data = self.audio.streams['input'].read(CHUNK, exception_on_overflow=False)
+                            client_socket.send(data)
+                        except Exception as e:
+                            logging.error(f"Error reading from input: {e}")
                 except Exception as e:
                     logging.error(f"Error sending audio to {address}: {e}")
                     break
@@ -148,7 +220,6 @@ class AudioServer:
 
     def stop(self):
         self.running = False
-        # Close all client connections
         for client in self.clients:
             try:
                 client.close()
