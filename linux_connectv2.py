@@ -193,67 +193,117 @@ class UnifiedServer:
         logging.info("Server logging initialized")
 
     def handle_clipboard_client(self, client_socket: socket.socket, address: str):
-        logging.info(f"New clipboard connection from {address}")
-        self.clipboard_handler.add_client(client_socket)
-        self.stats.update_clients(len(self.clipboard_handler.clients))
-        
-        try:
-            while self.running:
-                try:
-                    client_socket.settimeout(0.1)
-                    header = b""
-                    while b":" not in header:
-                        chunk = client_socket.recv(1)
-                        if not chunk:
-                            raise ConnectionError("Client disconnected")
-                        header += chunk
-                    
-                    size = int(header.decode('utf-8').strip(":"))
-                    data = b""
-                    remaining = size
-                    
-                    while remaining > 0:
-                        chunk = client_socket.recv(min(remaining, 8192))
-                        if not chunk:
-                            raise ConnectionError("Connection lost while receiving data")
-                        data += chunk
-                        remaining -= len(chunk)
-                    
-                    # Update transfer statistics
-                    self.stats.update_bytes(len(data))
-                    
-                    content = json.loads(data.decode('utf-8'))
-                    
-                    # Handle keep-alive messages
-                    if content.get('type') == 'keep_alive':
-                        continue
-                    
-                    # Broadcast to other clients
-                    message = f"{len(data)}:{data.decode('utf-8')}".encode('utf-8')
-                    self.clipboard_handler.broadcast(client_socket, message)
-                    
-                    if content.get('type') == 'files':
-                        self.stats.update_files(len(content.get('files', [])))
-                                
-                except socket.timeout:
-                    pass
-                except Exception as e:
-                    logging.error(f"Error handling client data: {e}")
-                    raise
-                    
-                time.sleep(0.1)
-                
-        except Exception as e:
-            logging.error(f"Clipboard client error: {e}")
-            logging.debug(f"Client error details: {traceback.format_exc()}")
-        finally:
-            self.clipboard_handler.remove_client(client_socket)
+            logging.info(f"New clipboard connection from {address}")
+            self.clipboard_handler.add_client(client_socket)
             self.stats.update_clients(len(self.clipboard_handler.clients))
+            
             try:
-                client_socket.close()
-            except:
-                pass
-            logging.info(f"Clipboard client disconnected: {address}")
+                while self.running:
+                    try:
+                        client_socket.settimeout(0.1)
+                        header = b""
+                        while b":" not in header:
+                            chunk = client_socket.recv(1)
+                            if not chunk:
+                                raise ConnectionError("Client disconnected")
+                            header += chunk
+                        
+                        size = int(header.decode('utf-8').strip(":"))
+                        data = b""
+                        remaining = size
+                        
+                        while remaining > 0:
+                            chunk = client_socket.recv(min(remaining, 8192))
+                            if not chunk:
+                                raise ConnectionError("Connection lost while receiving data")
+                            data += chunk
+                            remaining -= len(chunk)
+                        
+                        # Update transfer statistics
+                        self.stats.update_bytes(len(data))
+                        
+                        content = json.loads(data.decode('utf-8'))
+                        
+                        # Handle keep-alive messages
+                        if content.get('type') == 'keep_alive':
+                            continue
+                        
+                        # Handle different message types
+                        if content.get('type') == 'file_info':
+                            # Start collecting file chunks
+                            file_chunks = []
+                            file_info = content.copy()
+                            
+                            # Receive all chunks for this file
+                            while True:
+                                chunk_header = b""
+                                while b":" not in chunk_header:
+                                    chunk = client_socket.recv(1)
+                                    if not chunk:
+                                        raise ConnectionError("Client disconnected during chunk transfer")
+                                    chunk_header += chunk
+                                
+                                chunk_size = int(chunk_header.decode('utf-8').strip(":"))
+                                chunk_data = b""
+                                chunk_remaining = chunk_size
+                                
+                                while chunk_remaining > 0:
+                                    chunk = client_socket.recv(min(chunk_remaining, 8192))
+                                    if not chunk:
+                                        raise ConnectionError("Connection lost during chunk transfer")
+                                    chunk_data += chunk
+                                    chunk_remaining -= len(chunk)
+                                
+                                chunk_content = json.loads(chunk_data.decode('utf-8'))
+                                
+                                if chunk_content['type'] != 'file_chunk':
+                                    break
+                                    
+                                file_chunks.append(chunk_content['chunk'])
+                                
+                                if chunk_content.get('final'):
+                                    # Construct complete file message
+                                    complete_file = {
+                                        'type': 'files',
+                                        'files': [{
+                                            'name': file_info['name'],
+                                            'size': file_info['size'],
+                                            'data': ''.join(file_chunks),
+                                            'compressed': file_info['compressed']
+                                        }]
+                                    }
+                                    
+                                    # Broadcast complete file
+                                    file_data = json.dumps(complete_file)
+                                    message = f"{len(file_data)}:{file_data}".encode('utf-8')
+                                    self.clipboard_handler.broadcast(client_socket, message)
+                                    self.stats.update_files(1)
+                                    break
+                        else:
+                            # For non-file messages (text, etc), broadcast as normal
+                            message = f"{len(data)}:{data.decode('utf-8')}".encode('utf-8')
+                            self.clipboard_handler.broadcast(client_socket, message)
+                                    
+                    except socket.timeout:
+                        pass
+                    except Exception as e:
+                        logging.error(f"Error handling client data: {e}")
+                        logging.debug(f"Error details: {traceback.format_exc()}")
+                        raise
+                        
+                    time.sleep(0.1)
+                    
+            except Exception as e:
+                logging.error(f"Clipboard client error: {e}")
+                logging.debug(f"Client error details: {traceback.format_exc()}")
+            finally:
+                self.clipboard_handler.remove_client(client_socket)
+                self.stats.update_clients(len(self.clipboard_handler.clients))
+                try:
+                    client_socket.close()
+                except:
+                    pass
+                logging.info(f"Clipboard client disconnected: {address}")
 
     def get_local_ip(self) -> list:
         """Get all local IP addresses"""
