@@ -226,7 +226,6 @@ class UnifiedServer:
 
     def start(self):
         self.running = True
-        self.audio_server.running = True  # Set audio server running flag
         
         # Start clipboard server
         clipboard_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
