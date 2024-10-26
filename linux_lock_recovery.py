@@ -128,6 +128,7 @@ class AudioServer:
         self.running = False
         self.clients = set()
         self.audio = AudioHandler()
+        self.server_socket = None
         
         logging.basicConfig(
             level=logging.INFO,
@@ -195,16 +196,16 @@ class AudioServer:
             # Initialize audio services and streams
             self.audio.setup_streams()
             
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             
-            server_socket.bind((self.host, AUDIO_PORT))
-            server_socket.listen(5)
+            self.server_socket.bind((self.host, AUDIO_PORT))
+            self.server_socket.listen(5)
             logging.info(f"Audio server listening on {self.host}:{AUDIO_PORT}")
             
             while self.running:
                 try:
-                    client_socket, address = server_socket.accept()
+                    client_socket, address = self.server_socket.accept()
                     client_thread = threading.Thread(
                         target=self.handle_client,
                         args=(client_socket, address)
@@ -216,19 +217,28 @@ class AudioServer:
                     
         except Exception as e:
             logging.error(f"Server error: {e}")
-            
         finally:
             self.stop()
-            server_socket.close()
 
     def stop(self):
         self.running = False
+        
+        # Close all client connections
         for client in self.clients:
             try:
                 client.close()
             except:
                 pass
         self.clients.clear()
+        
+        # Close server socket
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            
+        # Cleanup audio
         self.audio.cleanup()
 
 if __name__ == "__main__":
