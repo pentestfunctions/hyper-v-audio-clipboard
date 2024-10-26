@@ -193,49 +193,58 @@ class UnifiedServer:
         logging.info("Server logging initialized")
 
     def handle_clipboard_client(self, client_socket: socket.socket, address: str):
-            logging.info(f"New clipboard connection from {address}")
-            self.clipboard_handler.add_client(client_socket)
-            self.stats.update_clients(len(self.clipboard_handler.clients))
-            
-            try:
-                while self.running:
-                    try:
-                        client_socket.settimeout(0.1)
-                        header = b""
-                        while b":" not in header:
-                            chunk = client_socket.recv(1)
-                            if not chunk:
-                                raise ConnectionError("Client disconnected")
-                            header += chunk
+        logging.info(f"New clipboard connection from {address}")
+        self.clipboard_handler.add_client(client_socket)
+        self.stats.update_clients(len(self.clipboard_handler.clients))
+        
+        try:
+            while self.running:
+                try:
+                    client_socket.settimeout(0.1)
+                    header = b""
+                    while b":" not in header:
+                        chunk = client_socket.recv(1)
+                        if not chunk:
+                            raise ConnectionError("Client disconnected")
+                        header += chunk
+                    
+                    size = int(header.decode('utf-8').strip(":"))
+                    data = b""
+                    remaining = size
+                    
+                    while remaining > 0:
+                        chunk = client_socket.recv(min(remaining, 8192))
+                        if not chunk:
+                            raise ConnectionError("Connection lost while receiving data")
+                        data += chunk
+                        remaining -= len(chunk)
+                    
+                    # Update transfer statistics
+                    self.stats.update_bytes(len(data))
+                    
+                    content = json.loads(data.decode('utf-8'))
+                    
+                    # Handle keep-alive messages
+                    if content.get('type') == 'keep_alive':
+                        continue
+                    
+                    # Handle different message types
+                    if content.get('type') == 'file_info':
+                        # Start collecting file chunks
+                        file_chunks = []
+                        file_info = content.copy()
                         
-                        size = int(header.decode('utf-8').strip(":"))
-                        data = b""
-                        remaining = size
+                        # Log the start of file transfer
+                        logging.info(f"Starting file transfer: {file_info['name']}, size: {file_info['size']} bytes")
                         
-                        while remaining > 0:
-                            chunk = client_socket.recv(min(remaining, 8192))
-                            if not chunk:
-                                raise ConnectionError("Connection lost while receiving data")
-                            data += chunk
-                            remaining -= len(chunk)
+                        # Initialize progress tracking
+                        total_size = file_info['size']
+                        received_size = 0
                         
-                        # Update transfer statistics
-                        self.stats.update_bytes(len(data))
-                        
-                        content = json.loads(data.decode('utf-8'))
-                        
-                        # Handle keep-alive messages
-                        if content.get('type') == 'keep_alive':
-                            continue
-                        
-                        # Handle different message types
-                        if content.get('type') == 'file_info':
-                            # Start collecting file chunks
-                            file_chunks = []
-                            file_info = content.copy()
-                            
-                            # Receive all chunks for this file
-                            while True:
+                        # Receive all chunks for this file
+                        while True:
+                            try:
+                                # Read chunk header
                                 chunk_header = b""
                                 while b":" not in chunk_header:
                                     chunk = client_socket.recv(1)
@@ -247,6 +256,7 @@ class UnifiedServer:
                                 chunk_data = b""
                                 chunk_remaining = chunk_size
                                 
+                                # Read chunk data
                                 while chunk_remaining > 0:
                                     chunk = client_socket.recv(min(chunk_remaining, 8192))
                                     if not chunk:
@@ -254,14 +264,32 @@ class UnifiedServer:
                                     chunk_data += chunk
                                     chunk_remaining -= len(chunk)
                                 
+                                # Parse chunk content
                                 chunk_content = json.loads(chunk_data.decode('utf-8'))
                                 
+                                # Verify chunk is part of current file transfer
                                 if chunk_content['type'] != 'file_chunk':
+                                    logging.error(f"Unexpected message type during file transfer: {chunk_content['type']}")
                                     break
                                     
+                                if chunk_content.get('name') != file_info['name']:
+                                    logging.error("Chunk belongs to different file")
+                                    break
+                                
+                                # Add chunk data to file
                                 file_chunks.append(chunk_content['chunk'])
+                                received_size += len(chunk_content['chunk'])
+                                
+                                # Log progress
+                                progress = (received_size / total_size) * 100
+                                logging.debug(f"File transfer progress: {progress:.1f}%")
                                 
                                 if chunk_content.get('final'):
+                                    # Verify we have all the data
+                                    if received_size != total_size:
+                                        logging.error(f"File size mismatch. Expected: {total_size}, Got: {received_size}")
+                                        break
+                                        
                                     # Construct complete file message
                                     complete_file = {
                                         'type': 'files',
@@ -273,37 +301,46 @@ class UnifiedServer:
                                         }]
                                     }
                                     
+                                    # Log completion
+                                    logging.info(f"File transfer completed: {file_info['name']}")
+                                    
                                     # Broadcast complete file
                                     file_data = json.dumps(complete_file)
                                     message = f"{len(file_data)}:{file_data}".encode('utf-8')
                                     self.clipboard_handler.broadcast(client_socket, message)
                                     self.stats.update_files(1)
                                     break
-                        else:
-                            # For non-file messages (text, etc), broadcast as normal
-                            message = f"{len(data)}:{data.decode('utf-8')}".encode('utf-8')
-                            self.clipboard_handler.broadcast(client_socket, message)
                                     
-                    except socket.timeout:
-                        pass
-                    except Exception as e:
-                        logging.error(f"Error handling client data: {e}")
-                        logging.debug(f"Error details: {traceback.format_exc()}")
-                        raise
-                        
-                    time.sleep(0.1)
-                    
-            except Exception as e:
-                logging.error(f"Clipboard client error: {e}")
-                logging.debug(f"Client error details: {traceback.format_exc()}")
-            finally:
-                self.clipboard_handler.remove_client(client_socket)
-                self.stats.update_clients(len(self.clipboard_handler.clients))
-                try:
-                    client_socket.close()
-                except:
+                            except Exception as e:
+                                logging.error(f"Error during chunk transfer: {str(e)}")
+                                logging.debug(f"Chunk error details: {traceback.format_exc()}")
+                                break
+                                
+                    else:
+                        # For non-file messages (text, etc), broadcast as normal
+                        message = f"{len(data)}:{data.decode('utf-8')}".encode('utf-8')
+                        self.clipboard_handler.broadcast(client_socket, message)
+                                
+                except socket.timeout:
                     pass
-                logging.info(f"Clipboard client disconnected: {address}")
+                except Exception as e:
+                    logging.error(f"Error handling client data: {str(e)}")
+                    logging.debug(f"Error details: {traceback.format_exc()}")
+                    raise
+                    
+                time.sleep(0.1)
+                
+        except Exception as e:
+            logging.error(f"Clipboard client error: {str(e)}")
+            logging.debug(f"Client error details: {traceback.format_exc()}")
+        finally:
+            self.clipboard_handler.remove_client(client_socket)
+            self.stats.update_clients(len(self.clipboard_handler.clients))
+            try:
+                client_socket.close()
+            except:
+                pass
+            logging.info(f"Clipboard client disconnected: {address}")
 
     def get_local_ip(self) -> list:
         """Get all local IP addresses"""
