@@ -98,6 +98,7 @@ class AudioServer:
         self.host = host
         self.port = port
         self.p = pyaudio.PyAudio()
+        # Open input stream for microphone capture
         self.audio_stream = self.p.open(
             format=FORMAT,
             channels=CHANNELS,
@@ -114,7 +115,7 @@ class AudioServer:
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((self.host, self.port))
         server_socket.listen(5)
-        logging.info(f"Server listening on {self.host}:{self.port}")
+        logging.info(f"Audio Server listening on {self.host}:{self.port}")
 
         # Accept new clients
         accept_thread = threading.Thread(target=self.accept_clients, args=(server_socket,))
@@ -132,31 +133,22 @@ class AudioServer:
 
     def accept_clients(self, server_socket):
         while self.running:
-            try:
-                client_socket, client_address = server_socket.accept()
-                logging.info(f"Client {client_address} connected")
-                self.clients.append(client_socket)
-            except Exception as e:
-                if self.running:
-                    logging.error(f"Error accepting audio client: {e}")
+            client_socket, client_address = server_socket.accept()
+            logging.info(f"Audio Client {client_address} connected")
+            self.clients.append(client_socket)
 
     def stream_audio(self):
         while self.running:
             try:
-                # Capture audio
+                # Capture audio from microphone
                 audio_data = self.audio_stream.read(CHUNK, exception_on_overflow=False)
                 # Send to each connected client
-                for client in self.clients[:]:  # Create a copy of the list for iteration
+                for client in self.clients[:]:  # Create a copy of list for safe iteration
                     try:
                         client.sendall(audio_data)
                     except Exception as e:
                         logging.error(f"Error sending audio to client: {e}")
-                        if client in self.clients:
-                            self.clients.remove(client)
-                        try:
-                            client.close()
-                        except:
-                            pass
+                        self.clients.remove(client)
             except Exception as e:
                 logging.error(f"Audio streaming error: {e}")
                 break
