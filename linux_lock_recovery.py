@@ -8,11 +8,11 @@ from queue import Queue
 import signal
 import sys
 
-# Audio Configuration
+# Audio Configuration - adjusted for PipeWire/XRDP
 CHUNK = 1024
-FORMAT = pyaudio.paInt16
+FORMAT = pyaudio.paFloat32  # Changed to float32 to match PipeWire's default
 CHANNELS = 2
-RATE = 44100
+RATE = 48000  # Changed to match your PipeWire configuration
 AUDIO_PORT = 5001
 
 class AudioHandler:
@@ -22,6 +22,24 @@ class AudioHandler:
         self.input_device_index = None
         self.output_device_index = None
         
+    def find_xrdp_devices(self):
+        """Find XRDP source and sink devices"""
+        for i in range(self.p.get_device_count()):
+            try:
+                device_info = self.p.get_device_info_by_index(i)
+                device_name = device_info['name'].lower()
+                
+                # Look for XRDP devices
+                if 'xrdp' in device_name and 'source' in device_name:
+                    self.input_device_index = i
+                    logging.info(f"Found XRDP source device: {device_info['name']}")
+                elif 'xrdp' in device_name and 'sink' in device_name:
+                    self.output_device_index = i
+                    logging.info(f"Found XRDP sink device: {device_info['name']}")
+                
+            except Exception as e:
+                logging.error(f"Error checking device {i}: {e}")
+
     def list_devices(self):
         """List all available audio devices"""
         info = []
@@ -36,41 +54,15 @@ class AudioHandler:
             except Exception as e:
                 info.append(f"Error getting device {i} info: {e}")
         return '\n'.join(info)
-        
+
     def setup_streams(self):
-        """Setup audio streams with detailed error reporting"""
+        """Setup audio streams specifically for XRDP environment"""
         logging.info("Available audio devices:\n" + self.list_devices())
         
-        # Try to find default devices
-        try:
-            default_input = self.p.get_default_input_device_info()
-            self.input_device_index = default_input['index']
-            logging.info(f"Using default input device: {default_input['name']}")
-        except Exception as e:
-            logging.warning(f"Could not get default input device: {e}")
-            # Try to find any available input device
-            for i in range(self.p.get_device_count()):
-                device_info = self.p.get_device_info_by_index(i)
-                if device_info['maxInputChannels'] > 0:
-                    self.input_device_index = i
-                    logging.info(f"Found alternative input device: {device_info['name']}")
-                    break
+        # Find XRDP devices
+        self.find_xrdp_devices()
         
-        try:
-            default_output = self.p.get_default_output_device_info()
-            self.output_device_index = default_output['index']
-            logging.info(f"Using default output device: {default_output['name']}")
-        except Exception as e:
-            logging.warning(f"Could not get default output device: {e}")
-            # Try to find any available output device
-            for i in range(self.p.get_device_count()):
-                device_info = self.p.get_device_info_by_index(i)
-                if device_info['maxOutputChannels'] > 0:
-                    self.output_device_index = i
-                    logging.info(f"Found alternative output device: {device_info['name']}")
-                    break
-
-        # Setup input stream with error handling
+        # Setup input stream
         try:
             if self.input_device_index is not None:
                 self.streams['input'] = self.p.open(
@@ -79,15 +71,16 @@ class AudioHandler:
                     rate=RATE,
                     input=True,
                     input_device_index=self.input_device_index,
-                    frames_per_buffer=CHUNK
+                    frames_per_buffer=CHUNK,
+                    stream_callback=None
                 )
                 logging.info("Input stream setup successfully")
             else:
-                logging.error("No suitable input device found")
+                logging.error("No XRDP source device found")
         except Exception as e:
             logging.error(f"Error setting up input stream: {e}")
 
-        # Setup output stream with error handling
+        # Setup output stream
         try:
             if self.output_device_index is not None:
                 self.streams['output'] = self.p.open(
@@ -96,11 +89,12 @@ class AudioHandler:
                     rate=RATE,
                     output=True,
                     output_device_index=self.output_device_index,
-                    frames_per_buffer=CHUNK
+                    frames_per_buffer=CHUNK,
+                    stream_callback=None
                 )
                 logging.info("Output stream setup successfully")
             else:
-                logging.error("No suitable output device found")
+                logging.error("No XRDP sink device found")
         except Exception as e:
             logging.error(f"Error setting up output stream: {e}")
 
@@ -141,13 +135,13 @@ class AudioServer:
         def receive_audio():
             while self.running:
                 try:
-                    data = client_socket.recv(CHUNK * 4)
+                    data = client_socket.recv(CHUNK * 8)  # Increased buffer size for float32
                     if not data:
                         break
                     
                     if self.audio.streams['output']:
                         try:
-                            self.audio.streams['output'].write(data)
+                            self.audio.streams['output'].write(data, CHUNK)
                         except Exception as e:
                             logging.error(f"Error playing audio: {e}")
                     
